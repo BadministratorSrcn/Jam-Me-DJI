@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- MSDK V5 requirements -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -10,13 +11,18 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-feature android:name="android.hardware.usb.host" />
+    <uses-feature android:name="android.hardware.usb.accessory" />
 
     <application
         android:name=".App"
         android:label="Tactical Pilot"
         android:theme="@android:style/Theme.Material.Light"
-        android:allowBackup="false">
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true"
+        tools:replace="android:usesCleartextTraffic">
 
         <!-- DJI Developer App Key for App "Tactical Pilot"
              (package com.tactical.pilot — matches applicationId) -->
@@ -37,6 +43,12 @@
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
+                android:resource="@xml/accessory_filter" />
         </activity>
     </application>
 </manifest>

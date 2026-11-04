@@ -98,25 +98,39 @@ Need tiles first? In the Jam-Me repo:
 python simulate.py --mode real --tiles-dir sim_tiles_myarea --no-wait
 ```
 
-Real drone: the RTMP URL from the Android app (`rtmp://<pc-ip>:1935/live`)
-is ingested automatically:
+Real drone: start the whole PC stack (mediamtx + bridge + GUI) with the
+launcher, then follow [`docs/REAL_FLIGHT.md`](docs/REAL_FLIGHT.md):
 
-```bash
-python pc_bridge/bridge_server.py --source rtmp://127.0.0.1:1935/live --port 8080
-# ffmpeg required on PATH (or --ff-path); run mediamtx (or similar) at 1935
+```powershell
+.\pc_bridge\run_real.ps1 -TilesDir C:\path\to\Jam-Me\sim_tiles_diyarbakir
 ```
+
+The Android app publishes `rtmp://<pc-ip>:1935/live`; the bridge ingests it
+with ffmpeg.
 
 ## Quick start (Android part)
 
-1. **DJI Developer Console** (developer.dji.com) → create an MSDK V5 app
-   → App Key (you must do this yourself once; free).
-2. Android Studio → open `app/` → paste your App Key into
-   `app/src/main/res/values/apikey.xml` placeholder.
-3. Follow MSDK V5 official sample for local AAR dependencies or repo
-   snippets (see `docs/ARCHITECTURE.md` → "Build notes").
-4. Connect RC-N2/N3 + Mini 4 Pro, run the app; it registers, connects,
-   starts RTMP out and polls ground PC for the visual fix; HUD shows
-   DJI-GPS vs visual-GPS divergence.
+The MSDK V5.18.0 dependencies are pulled from Maven Central — no manual AAR
+download is needed:
+
+```kotlin
+implementation("com.dji:dji-sdk-v5-aircraft:5.18.0")
+implementation("com.dji:dji-sdk-v5-aircraft-provided:5.18.0")
+implementation("com.dji:dji-sdk-v5-networkImp:5.18.0")
+```
+
+The App Key `dff381b608c20a4e62589660` and package `com.tactical.pilot` are
+already in the manifest. Build:
+
+```powershell
+cd app
+.\gradlew.bat assembleDebug   # or use the local Gradle 8.9 install
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+Connect RC-N2 + Mini 4 Pro, start the app, set the PC IP, press CONNECT,
+start RTMP, point the gimbal down, then ARM. Full checklist:
+[`docs/REAL_FLIGHT.md`](docs/REAL_FLIGHT.md).
 
 ## Status / roadmap
 
@@ -124,8 +138,9 @@ python pc_bridge/bridge_server.py --source rtmp://127.0.0.1:1935/live --port 808
 - [x] Tactical PC console (map click-to-go, camera HUD, calibration, mission queue)
 - [x] GPS-free position servo (GO / HOLD, stale-fix zero-velocity watchdog)
 - [x] Manual current-position anchoring (`/calibrate`) and two-point+ missions
-- [x] Android skeleton (registration/live stream/telemetry/HUD)
-- [ ] Wire real MSDK virtual-stick calls (needs AARs in `app/libs`; signs must be verified on the bench)
+- [x] Android app: MSDK 5.18 registration, telemetry, RTMP live stream, gimbal down, real virtual-stick runner
+- [ ] First real Mini 4 Pro flight (RC-N2) — bench arm + low hover validation
+- [ ] GPS-denied virtual-stick validation (DJI firmware permitting)
 - [ ] GPS-mode MSDK WaypointMission runner
 - [ ] EXIF geotagging of recorded media with visual fix
 - [ ] Phase 2: Kotlin port of visual core (when DJI fixes Mini 4 Pro `VideoFeed`)

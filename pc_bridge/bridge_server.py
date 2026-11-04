@@ -61,6 +61,8 @@ import main_tile as flight           # noqa: E402
 STATE = {
     "ts": 0.0,
     "last_update": -1e9,
+    "wall_update": 0.0,       # wall-clock time of the last visual fix
+    "fix_timeout": 1.0,       # copied from Config.position_timeout
     "fix_valid": False,
     "estimated": None,        # dict: lat/lon/conf/src/matches/heading/tile
     "frame": None,            # latest BGR frame for /snapshot
@@ -103,6 +105,16 @@ def drive_command():
     """GET /drive payload for the Android VirtualStick runner."""
     with CMD_LOCK:
         cmd = dict(CMD)
+    # Wall-clock backstop: if the frame pipeline stalls (RTMP freeze, ffmpeg
+    # hang, camera unplugged), the worker may block and never refresh
+    # fix_valid. Never publish a moving command after the visual fix expires.
+    with STATE_LOCK:
+        wall_age = time.time() - STATE.get("wall_update", 0.0)
+        stale = wall_age > STATE.get("fix_timeout", 1.0)
+    if stale and cmd["mode"] in ("go", "hold"):
+        cmd["v_forward"] = 0.0
+        cmd["v_right"] = 0.0
+        cmd["blind"] = True
     return {
         "id": cmd["id"],
         "mode": cmd["mode"],
@@ -219,20 +231,32 @@ log = sim_core.log
 # FRAME SOURCES
 # ============================================================
 class RtmpSource:
-    """ffmpeg → rawvideo(BGR24) stdout → frames (ffmpeg on PATH)."""
+    """ffmpeg → rawvideo(BGR24) stdout → frames (ffmpeg on PATH).
+
+    The publisher (the Android app) may start after the bridge, and it may
+    drop off mid-flight. ffmpeg is therefore respawned automatically; a
+    missing stream is a normal waiting state, not a fatal error.
+    """
 
     def __init__(self, url, frame_w=640, frame_h=480, ffmpeg="ffmpeg"):
+        self.url = url
         self.frame_w, self.frame_h = frame_w, frame_h
-        parts = url if url.startswith("file:") else url
+        self.ffmpeg = ffmpeg
+        self.frame_size = frame_w * frame_h * 3
+        self.proc = None
+        self._spawn()
+
+    def _spawn(self):
         cmd = [
-            ffmpeg, "-hide_banner", "-loglevel", "error",
-            "-i", url,
-            "-vf", f"scale={frame_w}:{frame_h}:force_original_aspect_ratio=decrease,"
-                   f"pad={frame_w}:{frame_h}:(ow-iw)/2:(oh-ih)/2",
+            self.ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-rw_timeout", "5000000",
+            "-i", self.url,
+            "-vf", f"scale={self.frame_w}:{self.frame_h}:force_original_aspect_ratio=decrease,"
+                   f"pad={self.frame_w}:{self.frame_h}:(ow-iw)/2:(oh-ih)/2",
             "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1",
         ]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=frame_w * frame_h * 3)
-        self.frame_size = frame_w * frame_h * 3
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     bufsize=self.frame_size)
 
     def read(self):
         need = self.frame_size
@@ -240,6 +264,14 @@ class RtmpSource:
         while len(buf) < need:
             chunk = self.proc.stdout.read(need - len(buf))
             if not chunk:
+                # Stream not published yet, or it just ended. Restart ffmpeg
+                # after a short pause so the bridge can wait indefinitely.
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+                self._spawn()
                 return None
             buf += chunk
         return np.frombuffer(buf, np.uint8).reshape(self.frame_h, self.frame_w, 3)
@@ -323,24 +355,54 @@ def worker(cfg, src, exit_evt, dt=0.25):
     with STATE_LOCK:
         STATE["tiles_loaded"] = len(tile_cache.tile_meta)
 
-    # first frame → initial localization
+    # first frame → initial localization. The publisher (phone RTMP) may not
+    # be live yet when the bridge starts, so wait for it instead of exiting.
     first = None
-    for _ in range(10):
+    last_wait_log = 0.0
+    while not exit_evt.is_set() and first is None:
         first = src.read()
-        if first is not None:
-            break
+        if first is None:
+            now_wait = time.time()
+            if now_wait - last_wait_log > 5.0:
+                log.info("waiting for first video frame from source...")
+                last_wait_log = now_wait
+            exit_evt.wait(0.5)
     if first is None:
         log.error("no initial frame available from source")
         return
     ok = init.find_initial_position(first)
     log.info(f"initial tile: {ok}" if ok else "initial localization FAILED")
+    last_init_try = time.time()
 
     last_fix_clock = -1e9
     while not exit_evt.is_set():
         frame = src.read()
         if frame is None:
+            # Stream stalled/ended: fail safe immediately instead of keeping
+            # the previous moving command alive.
+            with STATE_LOCK:
+                STATE["fix_valid"] = False
+            run_controller(None, None)
             exit_evt.wait(0.1)
             continue
+
+        # The first frame may be a boot screen or a forward-facing camera
+        # before the gimbal is pointed down. Keep retrying the global initial
+        # search until a tile is matched; without this the localizer has no
+        # active tiles and can never acquire a fix.
+        if not ok:
+            if time.time() - last_init_try >= 2.0:
+                last_init_try = time.time()
+                ok = init.find_initial_position(frame)
+                if ok:
+                    log.info("initial localization acquired on retry")
+            if not ok:
+                with STATE_LOCK:
+                    STATE["frame"] = frame.copy()
+                    STATE["fix_valid"] = False
+                run_controller(None, None)
+                continue
+
         res = localizer.match_frame(frame)
         now = SIM_NOW["t"] if isinstance(src, SimSource) else time.time()
 
@@ -388,6 +450,7 @@ def worker(cfg, src, exit_evt, dt=0.25):
                 STATE["estimated"] = est
                 STATE["ts"] = now
                 STATE["last_update"] = now
+                STATE["wall_update"] = time.time()
             STATE["fix_valid"] = bool(
                 est is not None and
                 (now - STATE.get("last_update", -1e9)) <= cfg.position_timeout)
@@ -422,12 +485,15 @@ class ApiHTTP(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         with STATE_LOCK:
+            wall_age = time.time() - STATE.get("wall_update", 0.0)
+            fresh = wall_age <= STATE.get("fix_timeout", 1.0)
             state = {
                 "ts": STATE["ts"],
                 "age_s": (round(max(0.0, time.time() - STATE["ts"]), 2)
                           if STATE["ts"] else None),
+                "fix_age_s": round(wall_age, 2),
                 "estimated": STATE["estimated"],
-                "fix_valid": STATE["fix_valid"],
+                "fix_valid": STATE["fix_valid"] and fresh,
                 "tiles_loaded": STATE["tiles_loaded"],
             }
         if path == "/status":
@@ -726,6 +792,8 @@ def main():
     CTRL.update(vmax=args.vmax, kp=args.kp, stop_radius=args.stop_radius)
 
     cfg = Config(tile_dir=args.tiles_dir)
+    with STATE_LOCK:
+        STATE["fix_timeout"] = cfg.position_timeout
 
     # area bounds for /command validation
     tile_cfg_path = os.path.join(args.tiles_dir, "tile_config.json")

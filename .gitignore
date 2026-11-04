@@ -7,4 +7,13 @@ __pycache__/
 pc_bridge/_map_*.png
 pc_bridge/_map_preview.png
 pc_bridge/_gui_screenshot.png
+pc_bridge/_app_*.png
+
+# Android build outputs / local machine config
+app/.gradle/
+app/build/
+app/app/build/
+app/local.properties
+app/.idea/
+*.iml
 

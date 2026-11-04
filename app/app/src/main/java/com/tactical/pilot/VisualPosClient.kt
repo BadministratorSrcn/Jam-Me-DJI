@@ -1,52 +1,115 @@
 package com.tactical.pilot
 
+import android.os.SystemClock
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Polls the ground-PC bridge (/status) and renders the HUD text that
- * merges DJI's own GPS reading with our visual fix, computing
- * divergence in meters.
+ * Polls the ground-PC bridge (/status and /drive) and keeps the HUD data.
+ *
+ * The bridge is the only source of navigation feedback. DJI's own GPS is
+ * read for the divergence display and is never sent back into the loop.
  */
-class VisualPosClient(private val host: String, private val port: Int) {
+class VisualPosClient(var host: String, var port: Int) {
 
-    // >>> DJI side telemetry (filled by TelemetryListener; see Telemetry.kt)
+    // DJI telemetry (filled by TelemetryListener)
     @Volatile var djiLat: Double? = null
     @Volatile var djiLon: Double? = null
     @Volatile var djiHdg: Double? = null
     @Volatile var djiAlt: Double? = null
     @Volatile var djiQuality: Int? = null
 
-    @Volatile var lastStatus: Map<String, Any?> = emptyMap()
-    @Volatile var lastDrive: Map<String, Any?>? = null
+    @Volatile var lastStatus: JSONObject? = null
+    @Volatile var lastDrive: JSONObject? = null
+    @Volatile var lastStatusAt = 0L
+    @Volatile var lastDriveAt = 0L
     @Volatile var lastError: String? = null
+    @Volatile var lastPollOk = false
 
-    fun hudText(): String {
-        val st = lastStatus
-        val est = st["estimated"] as? Map<String, Any?> ?: return "bridge: no visual fix"
-        val vLat = est["lat"] as? Double ?: return "bridge: no fix"
-        val vLon = est["lon"] as? Double ?: return "no fix"
-        val fmt = { d: Double? -> "%.7f".format(d ?: 0.0) }
-        val div = divergence(vLat, vLon)
-        val quality = djiQuality?.takeIf { it > 0 } ?: 0
-        val valid = st["fix_valid"] as? Boolean == true
-        val d = lastDrive
-        val driveLine = if (d != null)
-            "CMD  mode %s  dist %s m  v_f %+0.2f  v_r %+0.2f".format(
-                d["mode"], d["dist_m"] as? String ?: (d["dist_m"]?.toString() ?: "—"),
-                (d["v_forward"] as? Double ?: 0.0), (d["v_right"] as? Double ?: 0.0))
-            else "CMD  unknown"
-        return buildString {
-            appendLine("VISUAL  lat ${fmt(vLat)}  lon ${fmt(vLon)}")
-            appendLine("        conf ${est["conf"]}  matches ${est["matches"]}  src ${est["src"]}  tile ${est["tile"]}")
-            appendLine("DJI     lat ${fmt(djiLat)}  lon ${fmt(djiLon)}  GPS q=$quality")
-            appendLine("DIVERGENCE  ${if (div != null) "%.1f m".format(div) else "—"}  [${if (valid) "FIX VALID" else "FIX INVALID"}]")
-            appendLine(driveLine)
-            lastError?.let { appendLine("bridge err: $it") }
+    val baseUrl: String get() = "http://$host:$port"
+
+    fun driveAgeMs(): Long =
+        if (lastDriveAt == 0L) Long.MAX_VALUE else SystemClock.elapsedRealtime() - lastDriveAt
+
+    fun statusAgeMs(): Long =
+        if (lastStatusAt == 0L) Long.MAX_VALUE else SystemClock.elapsedRealtime() - lastStatusAt
+
+    fun poll(): Boolean {
+        return try {
+            val status = JSONObject(get("/status"))
+            lastStatus = status
+            lastStatusAt = SystemClock.elapsedRealtime()
+
+            val drive = JSONObject(get("/drive"))
+            lastDrive = drive
+            lastDriveAt = SystemClock.elapsedRealtime()
+
+            lastError = null
+            lastPollOk = true
+            true
+        } catch (e: Exception) {
+            lastError = e.message?.take(100) ?: e.javaClass.simpleName
+            lastPollOk = false
+            false
         }
     }
 
-    private fun divergence(vLat: Double, vLon: Double): Double? {
+    fun refreshOnce() = poll()
+
+    fun hudText(): String {
+        val st = lastStatus ?: return "bridge: no data yet (${lastError ?: "connecting"})"
+        val est = st.optJSONObject("estimated")
+        val fixValid = st.optBoolean("fix_valid", false)
+        val d = lastDrive
+        val age = driveAgeMs()
+
+        val visual = if (est != null) {
+            "VISUAL lat %.7f  lon %.7f  conf %.2f  matches %d  %s  tile %s".format(
+                est.optDouble("lat", 0.0),
+                est.optDouble("lon", 0.0),
+                est.optDouble("conf", 0.0),
+                est.optInt("matches", 0),
+                est.optString("src", "?"),
+                est.optString("tile", "?")
+            )
+        } else "VISUAL no fix"
+
+        val dji = if (djiLat != null && djiLon != null) {
+            "DJI    lat %.7f  lon %.7f  sats %s  hdg %s".format(
+                djiLat, djiLon, djiQuality ?: "—",
+                djiHdg?.let { "%.0f°".format(it) } ?: "—"
+            )
+        } else "DJI    telemetry pending"
+
+        val div = divergence(est)
+        val cmd = if (d != null) {
+            "CMD    %s  dist %s m  vf %+.2f  vr %+.2f  blind %s  age %s".format(
+                d.optString("mode", "?"),
+                d.optDouble("dist_m", Double.NaN).let { if (it.isNaN()) "—" else "%.2f".format(it) },
+                d.optDouble("v_forward", 0.0),
+                d.optDouble("v_right", 0.0),
+                d.optBoolean("blind", false),
+                ageText(age)
+            )
+        } else "CMD    no drive data"
+
+        return buildString {
+            appendLine(visual)
+            appendLine("FIX    ${if (fixValid) "VALID" else "INVALID"}  status age ${ageText(statusAgeMs())}")
+            appendLine(dji)
+            appendLine("DIVERGENCE  ${div?.let { "%.1f m".format(it) } ?: "—"}  (visual vs DJI GPS, reference only)")
+            appendLine(cmd)
+            if (!lastPollOk) appendLine("bridge err: ${lastError ?: "unreachable"}")
+        }
+    }
+
+    private fun ageText(ms: Long): String = if (ms == Long.MAX_VALUE) "—" else "$ms ms"
+
+    private fun divergence(est: JSONObject?): Double? {
+        val vLat = est?.optDouble("lat", Double.NaN) ?: return null
+        val vLon = est.optDouble("lon", Double.NaN)
+        if (vLat.isNaN() || vLon.isNaN()) return null
         val a = djiLat ?: return null
         val b = djiLon ?: return null
         val mLat = (vLat - a) * 111320.0
@@ -54,57 +117,16 @@ class VisualPosClient(private val host: String, private val port: Int) {
         return Math.hypot(mLat, mLon)
     }
 
-    fun refreshOnce() = poll()
-
-    fun poll(): Map<String, Any?> {
-        try {
-            val url = URL("http://$host:$port/status")
-            with(url.openConnection() as HttpURLConnection) {
-                connectTimeout = 1500
-                readTimeout = 1500
-                inputStream.bufferedReader().use { r ->
-                    lastError = null
-                    lastStatus = parse(r.readText())
-                }
-            }
-            val dURL = URL("http://$host:$port/drive")
-            with(dURL.openConnection() as HttpURLConnection) {
-                connectTimeout = 1500
-                readTimeout = 1500
-                inputStream.bufferedReader().use { r ->
-                    lastDrive = parseDrive(r.readText())
-                }
-            }
-        } catch (e: Exception) {
-            lastError = e.message?.take(80) ?: e.javaClass.simpleName
+    private fun get(path: String): String {
+        val connection = URL(baseUrl + path).openConnection() as HttpURLConnection
+        connection.connectTimeout = 1200
+        connection.readTimeout = 1200
+        connection.requestMethod = "GET"
+        connection.useCaches = false
+        return try {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
         }
-        return lastStatus
-    }
-
-    private fun parse(json: String): Map<String, Any?> {
-        // minimal parser (skeleton) — replace with org.json / kotlinx.serialization
-        val map = mutableMapOf<String, Any?>()
-        map["fix_valid"] = json.contains("\"fix_valid\":true")
-        val lat = Regex("\"lat\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)
-        val lon = Regex("\"lon\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)
-        val conf = Regex("\"conf\"\\s*:\\s*([0-9.]+)").find(json)?.groupValues?.get(1)
-        val matches = Regex("\"matches\"\\s*:\\s*([0-9]+)").find(json)?.groupValues?.get(1)
-        val src = Regex("\"src\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
-        val tile = Regex("\"tile\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
-        map["estimated"] = mapOf(
-            "lat" to lat?.toDouble(), "lon" to lon?.toDouble(),
-            "conf" to conf?.toDouble(), "matches" to matches?.toInt(),
-            "src" to (src ?: "?"), "tile" to (tile ?: "?"))
-        return map
-    }
-
-    private fun parseDrive(json: String): Map<String, Any?> {
-        val map = mutableMapOf<String, Any?>()
-        map["mode"] = Regex("\"mode\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
-        map["v_forward"] = Regex("\"v_forward\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)?.toDouble()
-        map["v_right"] = Regex("\"v_right\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)?.toDouble()
-        map["dist_m"] = Regex("\"dist_m\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)?.let { if (it == "null") null else it.toDouble() }
-        map["blind"] = json.contains("\"blind\":true")
-        return map
     }
 }

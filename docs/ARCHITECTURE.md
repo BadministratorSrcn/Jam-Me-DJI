@@ -174,23 +174,30 @@ the valid `area` bounds.
 
 ## 6. Build notes (Android)
 
-- Minimum Android 7 (SDK 24), target 34; Kotlin 1.9; minSdk of the MSDK
-  sample is the reference.
-- MSDK V5 dependency options:
-  - AAR files from the official sample `dev-sdk-main` (`api-<version>.aar`,
-    `components-*.aar`, UXSdk if desired) → copy to `app/libs/`.
-  - or jitpack-style coordinates if you keep them in your own repo.
-- Register the app key before any SDK call:
-  `MSDKApplication`-style init in `App.kt`, then
-  `SDKManager.getInstance().init(...)`.
-- App must stay foreground/screen-on while streaming (foreground service
-  `AndroidManifest` entry included with `FOREGROUND_SERVICE` +
-  `INTERNET` etc.).
-- Follow DJI requirements: SDK registration on internet connection
-  (first launch), runtime permissions list, and DJI's usage policy.
-- `VirtualStickRunner` is a stub: wire the official virtual-stick keys,
-  then verify pitch/roll signs on the bench before any flight. The sign
-  constants are marked `VERIFY ON HARDWARE`.
+- Android SDK 35, minSdk 24, Kotlin 2.1.0, AGP 8.7, Gradle 8.9 — the
+  same toolchain versions as the official MSDK sample.
+- MSDK V5.18.0 comes from Maven Central; no manual AAR download:
+  ```kotlin
+  implementation("com.dji:dji-sdk-v5-aircraft:5.18.0")
+  compileOnly("com.dji:dji-sdk-v5-aircraft-provided:5.18.0")
+  runtimeOnly("com.dji:dji-sdk-v5-networkImp:5.18.0")
+  ```
+  `provided` is **compile-only**. The aircraft AAR is a packed SDK: its
+  Java classes are installed from an in-memory dex by
+  `com.cySdkyc.clx.Helper.install(this)`. Do not package the provided jar;
+  its no-op stubs cause ART verifier errors.
+- `App.kt` overrides `attachBaseContext()` and calls
+  `Helper.install(this)` **before** `SDKManager.getInstance().init(...)`.
+  The App Key is read from the manifest meta-data
+  (`com.dji.sdk.API_KEY`).
+- Registration requires internet on first launch. The app must stay
+  foreground/screen-on while streaming (a foreground service is the next
+  hardening step; the current build keeps the activity alive).
+- Follow DJI requirements: SDK registration on internet connection,
+  runtime permissions, and DJI's usage policy.
+- `VirtualStickRunner` now sends real `VirtualStickFlightControlParam`
+  messages (BODY frame, velocity/angular-velocity modes). Pitch/roll signs
+  are verified on the bench with propellers removed before any flight.
 
 ## 7. Phase 2 (on-phone core) — plan
 
@@ -208,7 +215,12 @@ the valid `area` bounds.
 - Visual fix is advisory to DJI's own flight controller; DJI firmware
   remains authoritative.
 - Never disable obstacle/RTH protections for the experiment.
-- A stale fix must always produce zero velocity — never fly blind.
+- A stale fix must always produce zero velocity — never fly blind. The
+  bridge enforces this twice: the worker invalidates the fix after
+  `position_timeout`, and `/drive` has a wall-clock watchdog that zeroes
+  velocities if the frame pipeline stalls (RTMP freeze, ffmpeg hang,
+  camera unplugged). A blocked `src.read()` can never keep the last
+  moving command alive.
 - Optical flow must not dead-reckon indefinitely (`of_max_age`), and a
   fix lost for longer than `position_timeout` must pass the stronger
   reacquisition gate before commands resume.
