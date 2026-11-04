@@ -123,6 +123,7 @@ fix into the fields; `CLEAR` removes the offset.
 
 - **ADD TARGET** appends the lat/lon currently in the TARGET fields.
 - **REMOVE** deletes the selected row, **CLEAR** empties the queue.
+- Queue edits never start the aircraft; press **START MISSION** to fly.
 - **START MISSION** flies waypoint 1, then auto-advances each time the
   stop radius is reached. **SKIP** jumps to the next point.
 - When the last point is reached the mission completes and velocities go
@@ -141,7 +142,7 @@ All endpoints are JSON. `GET` unless noted.
 | `GET /health` | 200 when a fix exists, else 503 |
 | `POST /command` | `{"action":"go","lat":..,"lon":..}` · `hold` · `stop` |
 | `POST /calibrate` | `{"lat":..,"lon":..}` anchors the fix; `{"action":"clear"}` removes it |
-| `POST /mission` | `{"action":"set","points":[[lat,lon],...]}` · `start` · `clear` · `skip` |
+| `POST /mission` | `{"action":"set","points":[[lat,lon],...]}` (edit queue, does not start) · `start` · `clear` · `skip` |
 | `POST /settings` | any of `vmax` (m/s), `kp`, `stop_radius` (m), `hold_deadband` (m) |
 
 ### `/status`

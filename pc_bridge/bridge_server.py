@@ -587,6 +587,21 @@ class ApiHTTP(BaseHTTPRequestHandler):
             "current": [lat, lon],
         }).encode())
 
+    def _parse_mission_points(self, pts):
+        """Validate [[lat, lon], ...]; returns (clean, error-string)."""
+        if not isinstance(pts, list):
+            return None, "points must be a list"
+        clean = []
+        for i, p in enumerate(pts):
+            try:
+                p_lat, p_lon = float(p[0]), float(p[1])
+            except (TypeError, ValueError, IndexError):
+                return None, f"point {i} needs [lat, lon]"
+            if not in_area(p_lat, p_lon):
+                return None, f"point {i} outside the loaded tile area"
+            clean.append((p_lat, p_lon))
+        return clean, None
+
     def handle_mission(self, req):
         action = str(req.get("action", "set")).lower()
         if action == "clear":
@@ -597,28 +612,33 @@ class ApiHTTP(BaseHTTPRequestHandler):
             update_command("idle")
             self._send(200, json.dumps({"ok": True, "mission": mission_payload()}).encode())
             return
-        if action in ("start", "set"):
-            if action == "set" or "points" in req:
-                pts = req.get("points", [])
-                if not isinstance(pts, list) or not pts:
-                    self._send(400, json.dumps({"ok": False,
-                                                "error": "points must be a non-empty list"}).encode())
+        if action == "set":
+            # Queue editing only — never starts the aircraft.
+            pts = req.get("points")
+            if pts is None:
+                self._send(400, json.dumps({"ok": False,
+                                            "error": "set needs points"}).encode())
+                return
+            clean, err = self._parse_mission_points(pts)
+            if err:
+                self._send(400, json.dumps({"ok": False, "error": err,
+                                            "area": self._area_json()}).encode())
+                return
+            with CMD_LOCK:
+                MISSION["points"] = clean
+                MISSION["idx"] = -1
+                MISSION["active"] = False
+            update_command("idle")
+            self._send(200, json.dumps({"ok": True, "mode": "idle",
+                                        "mission": mission_payload()}).encode())
+            return
+        if action == "start":
+            if "points" in req:
+                clean, err = self._parse_mission_points(req.get("points"))
+                if err:
+                    self._send(400, json.dumps({"ok": False, "error": err,
+                                                "area": self._area_json()}).encode())
                     return
-                clean = []
-                for i, p in enumerate(pts):
-                    try:
-                        p_lat, p_lon = float(p[0]), float(p[1])
-                    except (TypeError, ValueError, IndexError):
-                        self._send(400, json.dumps({"ok": False,
-                                                    "error": f"point {i} needs [lat, lon]"}).encode())
-                        return
-                    if not in_area(p_lat, p_lon):
-                        self._send(400, json.dumps({
-                            "ok": False,
-                            "error": f"point {i} outside the loaded tile area",
-                            "area": self._area_json()}).encode())
-                        return
-                    clean.append((p_lat, p_lon))
                 with CMD_LOCK:
                     MISSION["points"] = clean
                     MISSION["idx"] = -1

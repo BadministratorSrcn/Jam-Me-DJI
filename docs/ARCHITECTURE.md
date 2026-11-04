@@ -137,7 +137,7 @@ at ~10 Hz and converts to virtual-stick pitch/roll.
 | `/command` | `{"action":"stop"}` | zero velocities, cancel mission |
 | `/calibrate` | `{"lat":..,"lon":..}` | anchor visual fix to a known coordinate |
 | `/calibrate` | `{"action":"clear"}` | remove the offset |
-| `/mission` | `{"action":"set","points":[[lat,lon],...]}` | replace the queue |
+| `/mission` | `{"action":"set","points":[[lat,lon],...]}` | replace the queue (does not start; empty list clears) |
 | `/mission` | `{"action":"start"}` / `"skip"` / `"clear"` | run / advance / empty the queue |
 | `/settings` | any of `vmax`,`kp`,`stop_radius`,`hold_deadband` | live controller tuning |
 
