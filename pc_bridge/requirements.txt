@@ -1,0 +1,5 @@
+opencv-python>=4.8
+numpy>=1.24
+# ffmpeg (binary, not pip) is REQUIRED only for `--source rtmp://...`
+#   Windows: winget install ffmpeg
+#   Linux:   sudo apt install ffmpeg
