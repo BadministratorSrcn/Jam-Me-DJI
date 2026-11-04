@@ -18,6 +18,7 @@ class VisualPosClient(private val host: String, private val port: Int) {
     @Volatile var djiQuality: Int? = null
 
     @Volatile var lastStatus: Map<String, Any?> = emptyMap()
+    @Volatile var lastDrive: Map<String, Any?>? = null
     @Volatile var lastError: String? = null
 
     fun hudText(): String {
@@ -29,11 +30,18 @@ class VisualPosClient(private val host: String, private val port: Int) {
         val div = divergence(vLat, vLon)
         val quality = djiQuality?.takeIf { it > 0 } ?: 0
         val valid = st["fix_valid"] as? Boolean == true
+        val d = lastDrive
+        val driveLine = if (d != null)
+            "CMD  mode %s  dist %s m  v_f %+0.2f  v_r %+0.2f".format(
+                d["mode"], d["dist_m"] as? String ?: (d["dist_m"]?.toString() ?: "—"),
+                (d["v_forward"] as? Double ?: 0.0), (d["v_right"] as? Double ?: 0.0))
+            else "CMD  unknown"
         return buildString {
             appendLine("VISUAL  lat ${fmt(vLat)}  lon ${fmt(vLon)}")
             appendLine("        conf ${est["conf"]}  matches ${est["matches"]}  src ${est["src"]}  tile ${est["tile"]}")
             appendLine("DJI     lat ${fmt(djiLat)}  lon ${fmt(djiLon)}  GPS q=$quality")
             appendLine("DIVERGENCE  ${if (div != null) "%.1f m".format(div) else "—"}  [${if (valid) "FIX VALID" else "FIX INVALID"}]")
+            appendLine(driveLine)
             lastError?.let { appendLine("bridge err: $it") }
         }
     }
@@ -59,6 +67,14 @@ class VisualPosClient(private val host: String, private val port: Int) {
                     lastStatus = parse(r.readText())
                 }
             }
+            val dURL = URL("http://$host:$port/drive")
+            with(dURL.openConnection() as HttpURLConnection) {
+                connectTimeout = 1500
+                readTimeout = 1500
+                inputStream.bufferedReader().use { r ->
+                    lastDrive = parseDrive(r.readText())
+                }
+            }
         } catch (e: Exception) {
             lastError = e.message?.take(80) ?: e.javaClass.simpleName
         }
@@ -68,22 +84,27 @@ class VisualPosClient(private val host: String, private val port: Int) {
     private fun parse(json: String): Map<String, Any?> {
         // minimal parser (skeleton) — replace with org.json / kotlinx.serialization
         val map = mutableMapOf<String, Any?>()
-        Regex("\"est_\\w+\"").find(json) // placeholder: real code uses org.json
-        map["fix_valid_typo_true"] = (json.contains("\"fix_valid\":true"))
+        map["fix_valid"] = json.contains("\"fix_valid\":true")
         val lat = Regex("\"lat\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)
         val lon = Regex("\"lon\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)
         val conf = Regex("\"conf\"\\s*:\\s*([0-9.]+)").find(json)?.groupValues?.get(1)
         val matches = Regex("\"matches\"\\s*:\\s*([0-9]+)").find(json)?.groupValues?.get(1)
         val src = Regex("\"src\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
         val tile = Regex("\"tile\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
-        map["fix_valid"] = json.contains("\"fix_valid\":true")
         map["estimated"] = mapOf(
             "lat" to lat?.toDouble(), "lon" to lon?.toDouble(),
             "conf" to conf?.toDouble(), "matches" to matches?.toInt(),
             "src" to (src ?: "?"), "tile" to (tile ?: "?"))
         return map
     }
-}
 
-private operator fun <K, V> Map<K, V>.get(key: String, default: V): V =
-    (this as? Map<String, Any?>)?.let { (it[key] as? V) ?: default } ?: default
+    private fun parseDrive(json: String): Map<String, Any?> {
+        val map = mutableMapOf<String, Any?>()
+        map["mode"] = Regex("\"mode\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
+        map["v_forward"] = Regex("\"v_forward\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)?.toDouble()
+        map["v_right"] = Regex("\"v_right\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)?.toDouble()
+        map["dist_m"] = Regex("\"dist_m\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)?.let { if (it == "null") null else it.toDouble() }
+        map["blind"] = json.contains("\"blind\":true")
+        return map
+    }
+}

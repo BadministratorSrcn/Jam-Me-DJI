@@ -40,6 +40,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 
+M_LAT = 111320.0          # meters per degree latitude
+
 # --- visual core (git submodule of the Jam-Me Pi repo) ---
 HERE = os.path.dirname(os.path.abspath(__file__))
 CORE = os.environ.get("JAMME_CORE") or os.path.join(HERE, "core")
@@ -68,6 +70,94 @@ STATE = {
 STATE_LOCK = threading.Lock()
 SIM_NOW = {"t": 0.0}
 SIM_START_WALL = None          # set by SimSource while active
+AREA_BOX = None                # ((lat_min, lat_max), (lon_min, lon_max))
+
+# --- control command state (PC GUI -> app VirtualStick) ---
+CMD = {
+    "id": 0,
+    "mode": "idle",            # idle | go | hold | complete
+    "target": None,            # (lat, lon) in degrees
+    "v_forward": 0.0,          # m/s along camera heading
+    "v_right": 0.0,            # m/s to the right of heading
+    "dist_m": None,
+    "bearing_deg": None,
+    "blind": False,            # fix invalid while a command is active
+}
+CMD_LOCK = threading.Lock()
+
+# bridge-side control defaults (overridable via CLI flags)
+CTRL = {"vmax": 2.5, "kp": 0.6, "stop_radius": 1.5}   # m/s, gain, m
+
+
+def drive_command():
+    """GET /drive payload for the Android VirtualStick runner."""
+    with CMD_LOCK:
+        cmd = dict(CMD)
+    return {
+        "id": cmd["id"],
+        "mode": cmd["mode"],
+        "target": cmd["target"],
+        "v_forward": round(cmd["v_forward"], 3),
+        "v_right": round(cmd["v_right"], 3),
+        "dist_m": cmd["dist_m"],
+        "bearing_deg": cmd["bearing_deg"],
+        "blind": cmd["blind"],
+        "note": "velocities are body-frame (forward=along heading); "
+                "vmax=%s; blind fix => zero" % CTRL["vmax"],
+    }
+
+
+def update_command(mode_="idle", target=None):
+    """PC-side command entry (POST /command)."""
+    with CMD_LOCK:
+        CMD["id"] += 1
+        CMD["mode"] = mode_
+        CMD["target"] = target
+        CMD["v_forward"] = CMD["v_right"] = 0.0
+        CMD["blind"] = False
+        if mode_ != "go":
+            CMD["dist_m"] = CMD["bearing_deg"] = None
+
+
+def run_controller(est, heading_deg):
+    """
+    The GPS-free position servo used for BOTH 'go' and 'hold'.
+
+    Feedback comes exclusively from the visual fix (tile matching +
+    Kalman). If the fix is stale/blind, velocities are forced to zero —
+    the aircraft holds via VirtualStick zeros instead of flying blind.
+    """
+    if est is None:
+        with CMD_LOCK:
+            if CMD["mode"] in ("go", "hold"):
+                CMD["blind"] = True
+                CMD["v_forward"] = CMD["v_right"] = 0.0
+        return
+
+    with CMD_LOCK:
+        if CMD["mode"] not in ("go", "hold") or CMD["target"] is None:
+            return
+        t_lat, t_lon = CMD["target"]
+        # error in meters (north, east)
+        dn = (t_lat - est["lat"]) * M_LAT
+        de = (t_lon - est["lon"]) * M_LAT * math.cos(math.radians(est["lat"]))
+        dist = math.hypot(de, dn)
+        CMD["blind"] = False
+        CMD["dist_m"] = round(dist, 2)
+        CMD["bearing_deg"] = round(math.degrees(math.atan2(de, dn)) % 360, 1)
+
+        if CMD["mode"] == "go" and dist <= CTRL["stop_radius"]:
+            CMD["mode"] = "complete"
+            CMD["v_forward"] = CMD["v_right"] = 0.0
+            return
+
+        v = min(CTRL["kp"] * dist, CTRL["vmax"])
+        th = math.radians(heading_deg)
+        f_comp = de * math.sin(th) + dn * math.cos(th)
+        r_comp = de * math.cos(th) - dn * math.sin(th)
+        d = max(dist, 1e-6)
+        CMD["v_forward"] = round(v * f_comp / d, 3)
+        CMD["v_right"] = round(v * r_comp / d, 3)
 
 log = sim_core.log
 
@@ -123,35 +213,55 @@ class FileSource:
 
 
 class SimSource:
-    """Offline demo: the same VirtualCamera + flight plan as simulate.py."""
+    """
+    Offline closed-loop drone: flies the scripted plan only in the first
+    seconds; afterwards it is driven EXCLUSIVELY by the bridge's visual
+    servo (`step()` integrates commanded body velocities). With
+    speed=0 and a flat plan the sim is a pure "GPS-less control sandbox"
+    — exactly what the PC GUI + /drive loop will exercise in production.
+    """
 
-    def __init__(self, tiles_dir, origin, duration=48.0, speed=12.0, dt=0.25):
+    def __init__(self, tiles_dir, duration=48.0, speed=0.0, dt=0.25):
         self.cam = sim_core.VirtualCamera(
             os.path.join(tiles_dir, "tile_config.json"), tiles_dir)
         self.plan = sim_core.FlightPlan(origin_m=(350.0, 750.0), speed=speed)
         self.plan.set_segments(duration)
         self.duration, self.dt, self.i = duration, dt, 0
         self.start_wall = time.time()
+        self.origin_m = [350.0, 750.0]        # mutable (east, north)
 
     def read(self):
-        t = self.i * self.dt
-        if t > self.duration + 2:
-            self.i = 0
-            t = 0
+        # time advances by dt per read (process as fast as possible)
+        e, n, imp = self.plan.position_at(self.i * self.dt)
         self.i += 1
         global SIM_START_WALL
         SIM_START_WALL = self.start_wall
-        SIM_NOW["t"] = self.start_wall + t
-        e, n, imp = self.plan.position_at(t)
+        SIM_NOW["t"] = self.start_wall + self.i * self.dt
         lat = self.cam.origin_lat - sim_core.deg_lat(n)
         lon = self.cam.origin_lon + e * sim_core.lon_per_meter(self.cam.origin_lat)
         return self.cam.render(lat, lon, 0.0, imp)
+
+    def step(self, v_forward, v_right, dt):
+        """
+        Integrate commanded body velocities (m/s) into the sim drone's
+        position. NOTE the flight-plan coordinate semantics:
+        origin_m = [meter EAST, meter SOUTH] of the grid corner (image
+        convention, matching sim_core.FlightPlan/virtual camera y axis).
+        Camera heading sim = 0 ⇒ forward points NORTH ⇒ south-positive
+        y DECREASES.
+        """
+        if dt <= 0:
+            return
+        self.origin_m[0] += v_right * dt
+        self.origin_m[1] -= v_forward * dt
+        # repaint the flight plan origin so position_at() mirrors it
+        self.plan.origin = (self.origin_m[0], self.origin_m[1])
 
 
 # ============================================================
 # WORKER — frames → localizer → kalman → STATE
 # ============================================================
-def worker(cfg, src, exit_evt):
+def worker(cfg, src, exit_evt, dt=0.25):
     tile_cache = flight.TileCache(cfg)
     localizer = flight.TileLocalizer(tile_cache, cfg)
     kalman = PositionKalman(cfg.process_noise, cfg.measurement_noise)
@@ -189,6 +299,16 @@ def worker(cfg, src, exit_evt):
                 "heading": res.heading, "tile": res.tile_key,
                 "src": ("optical_flow" if res.tile_key == "optical_flow" else "visual")
             }
+            # GPS-free position servo -> body velocities for VirtualStick
+            run_controller(est, res.heading)
+        else:
+            # fix lost: zero the servos (safe hold in place)
+            run_controller(None, None)
+        # sim-only: apply commanded velocities to the virtual drone
+        if isinstance(src, SimSource):
+            with CMD_LOCK:
+                vf, vr = CMD["v_forward"], CMD["v_right"]
+            src.step(vf, vr, dt)
         with STATE_LOCK:
             STATE["frame"] = frame.copy()
             if est:
@@ -226,14 +346,18 @@ class ApiHTTP(BaseHTTPRequestHandler):
         with STATE_LOCK:
             state = {
                 "ts": STATE["ts"],
-                "age_s": round(SIM_NOW["t"] - STATE["ts"], 2)
-                         if isinstance(SIM_NOW.get("t"), (int, float)) and STATE["ts"] else None,
+                "age_s": round(time.time() - STATE["ts"], 2) if STATE["ts"] else None,
                 "estimated": STATE["estimated"],
                 "fix_valid": STATE["fix_valid"],
                 "tiles_loaded": STATE["tiles_loaded"],
             }
         if path == "/status":
             body = json.dumps(state).encode()
+            self._send(200, body)
+
+        elif path == "/drive":
+            drive = drive_command()
+            body = json.dumps(drive).encode()
             self._send(200, body)
 
         elif path == "/snapshot":
@@ -256,9 +380,54 @@ class ApiHTTP(BaseHTTPRequestHandler):
         else:
             self._send(404, b'{"error":"not found"}')
 
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path != "/command":
+            self._send(404, b'{"error":"not found"}')
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            req = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as e:
+            self._send(400, json.dumps({"ok": False, "error": f"bad json: {e}"}).encode())
+            return
+
+        action = str(req.get("action", "")).lower()
+        if action == "go":
+            t_lat, t_lon = req.get("lat"), req.get("lon")
+            if t_lat is None or t_lon is None:
+                self._send(400, json.dumps({"ok": False, "error": "go needs lat/lon"}).encode())
+                return
+            if AREA_BOX is None:
+                self._send(500, json.dumps({"ok": False, "error": "no tile area loaded"}).encode())
+                return
+            lat0, lat1 = AREA_BOX[0]; lon0, lon1 = AREA_BOX[1]
+            if not (lat0 <= t_lat <= lat1 and lon0 <= t_lon <= lon1):
+                self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "target outside the loaded tile area",
+                    "area": {"lat": [lat0, lat1], "lon": [lon0, lon1]}}).encode())
+                return
+            update_command("go", (float(t_lat), float(t_lon)))
+            self._send(200, json.dumps({"ok": True, "mode": "go", "target": [t_lat, t_lon],
+                                        **CTRL}).encode())
+        elif action == "hold":
+            est = STATE["estimated"]
+            if est is None:
+                self._send(409, json.dumps({"ok": False, "error": "no visual fix yet to hold"}).encode())
+                return
+            update_command("hold", (est["lat"], est["lon"]))
+            self._send(200, json.dumps({"ok": True, "mode": "hold", "target": [est["lat"], est["lon"]]}).encode())
+        elif action == "stop":
+            update_command("idle")
+            self._send(200, json.dumps({"ok": True, "mode": "idle"}).encode())
+        else:
+            self._send(400, json.dumps({"ok": False, "error": "unknown action (go|hold|stop)"}).encode())
+
 
 # ============================================================
 def main():
+    global AREA_BOX
     p = argparse.ArgumentParser(description="Jam-Me-DJI ground bridge")
     p.add_argument("--source", required=True,
                    help="rtmp://URL | file:PATH | sim")
@@ -267,15 +436,35 @@ def main():
                    help="sim mode grid corner lat,lon (from tile_config by default)")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--ff-path", default="ffmpeg", help="ffmpeg binary path")
+    p.add_argument("--vmax", type=float, default=CTRL["vmax"], help="max commanded speed m/s")
+    p.add_argument("--kp", type=float, default=CTRL["kp"])
+    p.add_argument("--stop-radius", type=float, default=CTRL["stop_radius"])
+    p.add_argument("--sim-speed", type=float, default=0.0,
+                   help="sim mode wind (auto flight) speed m/s; 0 = pure control sandbox")
+    p.add_argument("--sim-duration", type=float, default=30.0)
+    p.add_argument("--sim-dt", type=float, default=0.25)
     args = p.parse_args()
+
+    CTRL.update(vmax=args.vmax, kp=args.kp, stop_radius=args.stop_radius)
 
     cfg = Config(tile_dir=args.tiles_dir)
 
+    # area bounds for /command validation
+    tile_cfg_path = os.path.join(args.tiles_dir, "tile_config.json")
+    if not os.path.exists(tile_cfg_path):
+        print(f"tiles not found: {tile_cfg_path} — run simulate.py first")
+        sys.exit(1)
+    with open(tile_cfg_path) as f:
+        tc = json.load(f)
+    area = tc["area"]
+    AREA_BOX = (
+        (area["bottom_right"]["lat"], area["top_left"]["lat"]),
+        (area["top_left"]["lon"], area["bottom_right"]["lon"]),
+    )
+
     if args.source == "sim":
-        if not os.path.exists(os.path.join(args.tiles_dir, "tile_config.json")):
-            print(f"tiles not found at {args.tiles_dir} — run simulate.py once for that area")
-            sys.exit(1)
-        src = SimSource(args.tiles_dir, args.origin)
+        src = SimSource(args.tiles_dir, duration=args.sim_duration,
+                        speed=args.sim_speed, dt=args.sim_dt)
     elif args.source.startswith("rtmp"):
         src = RtmpSource(args.source, ffmpeg=args.ff_path)
     elif args.source.startswith("file:"):
@@ -284,7 +473,7 @@ def main():
         print("unknown --source"); sys.exit(1)
 
     exit_evt = threading.Event()
-    threading.Thread(target=worker, args=(cfg, src, exit_evt), daemon=True).start()
+    threading.Thread(target=worker, args=(cfg, src, exit_evt, getattr(src, "dt", 0.0)), daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), ApiHTTP)
     print("=" * 64)

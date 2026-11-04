@@ -24,21 +24,25 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var posView: TextView
     private lateinit var streamBtn: Button
+    private lateinit var armBtn: Button
     private lateinit var demoBtn: Button
     private lateinit var client: VisualPosClient
     private var uiAlive = true
+    private var stick: VirtualStickRunner? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         statusView = TextView(this).apply { text = status.lines.joinToString("\n") }
         posView = TextView(this).apply { textSize = 18f }
         streamBtn = Button(this).apply { text = "RTMP stream: START" }
+        armBtn = Button(this).apply { text = "PC CONTROL: ARM" }
         demoBtn = Button(this).apply { text = "Re-poll bridge now" }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(statusView)
             addView(posView)
             addView(streamBtn)
+            addView(armBtn)
             addView(demoBtn)
         }
         setContentView(root)
@@ -48,8 +52,17 @@ class MainActivity : Activity() {
             rtmpUrl = "rtmp://192.168.32.123:1935/live",
             onState = { ok -> runOnUiThread { streamBtn.text = "RTMP stream: ${if (ok) "RUNNING" else "IDLE"}" } }) }
         demoBtn.setOnClickListener { client.refreshOnce() }
+        armBtn.setOnClickListener {
+            if (stick?.isArmed() == true) {
+                stick?.disarm()
+                armBtn.text = "PC CONTROL: ARM"
+            } else {
+                stick = VirtualStickRunner(client) { s -> runOnUiThread { armBtn.text = "PC CONTROL: $s" } }
+                stick?.arm()
+            }
+        }
 
-        // background UI refresh loop
+        // background UI refresh loop — polls /status + /drive from the bridge
         Thread {
             while (uiAlive) {
                 client.poll()
