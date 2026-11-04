@@ -86,7 +86,17 @@ CMD = {
 CMD_LOCK = threading.Lock()
 
 # bridge-side control defaults (overridable via CLI flags)
-CTRL = {"vmax": 2.5, "kp": 0.6, "stop_radius": 1.5}   # m/s, gain, m
+CTRL = {"vmax": 2.5, "kp": 0.6, "stop_radius": 1.5,
+        "hold_deadband": 0.35}                        # m/s, gain, m, m
+
+# manual position correction (entered from PC GUI): offset added to the
+# visual fix. Lets the operator anchor the estimate to a measured real
+# coordinate without breaking the closed loop (visual fixes continue,
+# shifted by the given amount).
+CAL_OFFSET = {"dlat": 0.0, "dlon": 0.0, "enabled": False}
+
+# multi-point mission queue (PC GUI builds it)
+MISSION = {"points": [], "idx": -1, "active": False}
 
 
 def drive_command():
@@ -119,6 +129,32 @@ def update_command(mode_="idle", target=None):
             CMD["dist_m"] = CMD["bearing_deg"] = None
 
 
+def in_area(lat, lon):
+    """True when a coordinate lies inside the loaded tile rectangle."""
+    if AREA_BOX is None:
+        return False
+    lat0, lat1 = AREA_BOX[0]
+    lon0, lon1 = AREA_BOX[1]
+    return lat0 <= lat <= lat1 and lon0 <= lon <= lon1
+
+
+def mission_payload():
+    with CMD_LOCK:
+        m = dict(MISSION)
+        m["points"] = [list(p) for p in MISSION["points"]]
+        current = (MISSION["points"][MISSION["idx"]]
+                   if 0 <= MISSION["idx"] < len(MISSION["points"]) else None)
+    m["current"] = list(current) if current else None
+    m["count"] = len(m["points"])
+    return m
+
+
+def apply_calibration(raw_lat, raw_lon):
+    """Shift a raw visual fix by the operator-entered anchor offset."""
+    with CMD_LOCK:
+        return raw_lat + CAL_OFFSET["dlat"], raw_lon + CAL_OFFSET["dlon"]
+
+
 def run_controller(est, heading_deg):
     """
     The GPS-free position servo used for BOTH 'go' and 'hold'.
@@ -147,7 +183,24 @@ def run_controller(est, heading_deg):
         CMD["bearing_deg"] = round(math.degrees(math.atan2(de, dn)) % 360, 1)
 
         if CMD["mode"] == "go" and dist <= CTRL["stop_radius"]:
+            # mission auto-advance: fly the queue waypoint by waypoint
+            if MISSION["active"] and MISSION["idx"] + 1 < len(MISSION["points"]):
+                MISSION["idx"] += 1
+                CMD["target"] = tuple(MISSION["points"][MISSION["idx"]])
+                CMD["mode"] = "go"
+                CMD["v_forward"] = CMD["v_right"] = 0.0
+                log.info("Mission waypoint %d/%d reached → next target"
+                         % (MISSION["idx"], len(MISSION["points"])))
+                return
+            if MISSION["active"]:
+                MISSION["active"] = False
+                MISSION["idx"] = -1
+                log.info("Mission complete")
             CMD["mode"] = "complete"
+            CMD["v_forward"] = CMD["v_right"] = 0.0
+            return
+
+        if CMD["mode"] == "hold" and dist <= CTRL.get("hold_deadband", 0.35):
             CMD["v_forward"] = CMD["v_right"] = 0.0
             return
 
@@ -282,6 +335,7 @@ def worker(cfg, src, exit_evt, dt=0.25):
     ok = init.find_initial_position(first)
     log.info(f"initial tile: {ok}" if ok else "initial localization FAILED")
 
+    last_fix_clock = -1e9
     while not exit_evt.is_set():
         frame = src.read()
         if frame is None:
@@ -292,16 +346,35 @@ def worker(cfg, src, exit_evt, dt=0.25):
 
         est = None
         if res.found:
-            k_lat, k_lon = kalman.update(res.lat, res.lon, res.confidence)
-            est = {
-                "lat": k_lat, "lon": k_lon,
-                "conf": res.confidence, "matches": res.match_count,
-                "heading": res.heading, "tile": res.tile_key,
-                "src": ("optical_flow" if res.tile_key == "optical_flow" else "visual")
-            }
-            # GPS-free position servo -> body velocities for VirtualStick
-            run_controller(est, res.heading)
-        else:
+            gap = now - last_fix_clock > cfg.position_timeout
+            # Reacquisition gate: after a blind gap, demand a strong full
+            # tile match. A weak/jumpy match must not wake the controller.
+            if gap and (res.tile_key == "optical_flow" or
+                        res.match_count < cfg.reacq_min_matches or
+                        res.confidence < cfg.reacq_min_confidence):
+                log.warning("Reacquisition rejected (matches=%d conf=%.2f)"
+                            % (res.match_count, res.confidence))
+                res.found = False
+            else:
+                if gap:
+                    # Re-seed the filter with the new match; the old state
+                    # is stale and would drag the output for seconds.
+                    kalman.reset(res.lat, res.lon, now=now)
+                    k_lat, k_lon = res.lat, res.lon
+                else:
+                    k_lat, k_lon = kalman.update(res.lat, res.lon, res.confidence,
+                                                 now=now)
+                last_fix_clock = now
+                k_lat, k_lon = apply_calibration(k_lat, k_lon)
+                est = {
+                    "lat": k_lat, "lon": k_lon,
+                    "conf": res.confidence, "matches": res.match_count,
+                    "heading": res.heading, "tile": res.tile_key,
+                    "src": ("optical_flow" if res.tile_key == "optical_flow" else "visual")
+                }
+                # GPS-free position servo -> body velocities for VirtualStick
+                run_controller(est, res.heading)
+        if est is None:
             # fix lost: zero the servos (safe hold in place)
             run_controller(None, None)
         # sim-only: apply commanded velocities to the virtual drone
@@ -341,24 +414,36 @@ class ApiHTTP(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _area_json(self):
+        if AREA_BOX is None:
+            return None
+        return {"lat": list(AREA_BOX[0]), "lon": list(AREA_BOX[1])}
+
     def do_GET(self):
         path = self.path.split("?")[0]
         with STATE_LOCK:
             state = {
                 "ts": STATE["ts"],
-                "age_s": round(time.time() - STATE["ts"], 2) if STATE["ts"] else None,
+                "age_s": (round(max(0.0, time.time() - STATE["ts"]), 2)
+                          if STATE["ts"] else None),
                 "estimated": STATE["estimated"],
                 "fix_valid": STATE["fix_valid"],
                 "tiles_loaded": STATE["tiles_loaded"],
             }
         if path == "/status":
-            body = json.dumps(state).encode()
-            self._send(200, body)
+            state["ctrl"] = dict(CTRL)
+            state["cal_offset"] = dict(CAL_OFFSET)
+            state["mission"] = mission_payload()
+            state["area"] = self._area_json()
+            state["mode"] = drive_command()["mode"]
+            self._send(200, json.dumps(state).encode())
 
         elif path == "/drive":
-            drive = drive_command()
-            body = json.dumps(drive).encode()
+            body = json.dumps(drive_command()).encode()
             self._send(200, body)
+
+        elif path == "/mission":
+            self._send(200, json.dumps(mission_payload()).encode())
 
         elif path == "/snapshot":
             with STATE_LOCK:
@@ -373,56 +458,229 @@ class ApiHTTP(BaseHTTPRequestHandler):
             self._send(200, jpg.tobytes(), "image/jpeg")
 
         elif path == "/health":
-            ok = STATE["estimated"] is not None
+            with STATE_LOCK:
+                ok = STATE["estimated"] is not None
+                age = (time.time() - STATE["ts"]) if STATE["ts"] else None
             self._send(200 if ok else 503,
-                       json.dumps({"ok": ok, "backend": "bridge"}).encode(),
+                       json.dumps({"ok": ok, "backend": "bridge",
+                                   "fix_age_s": round(age, 2) if age else None}).encode(),
                        "application/json")
         else:
             self._send(404, b'{"error":"not found"}')
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path != "/command":
-            self._send(404, b'{"error":"not found"}')
-            return
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
-            req = json.loads(self.rfile.read(length) or b"{}")
+            body = self.rfile.read(length) or b"{}"
+            req = json.loads(body)
         except Exception as e:
             self._send(400, json.dumps({"ok": False, "error": f"bad json: {e}"}).encode())
             return
 
+        if path == "/command":
+            self.handle_command(req)
+        elif path == "/calibrate":
+            self.handle_calibrate(req)
+        elif path == "/mission":
+            self.handle_mission(req)
+        elif path == "/settings":
+            self.handle_settings(req)
+        else:
+            self._send(404, b'{"error":"not found"}')
+
+    # ---- POST endpoints -----------------------------------------
+    def handle_command(self, req):
         action = str(req.get("action", "")).lower()
         if action == "go":
             t_lat, t_lon = req.get("lat"), req.get("lon")
             if t_lat is None or t_lon is None:
                 self._send(400, json.dumps({"ok": False, "error": "go needs lat/lon"}).encode())
                 return
+            try:
+                t_lat, t_lon = float(t_lat), float(t_lon)
+            except (TypeError, ValueError):
+                self._send(400, json.dumps({"ok": False, "error": "lat/lon must be numbers"}).encode())
+                return
             if AREA_BOX is None:
                 self._send(500, json.dumps({"ok": False, "error": "no tile area loaded"}).encode())
                 return
-            lat0, lat1 = AREA_BOX[0]; lon0, lon1 = AREA_BOX[1]
-            if not (lat0 <= t_lat <= lat1 and lon0 <= t_lon <= lon1):
+            if not in_area(t_lat, t_lon):
                 self._send(400, json.dumps({
                     "ok": False,
                     "error": "target outside the loaded tile area",
-                    "area": {"lat": [lat0, lat1], "lon": [lon0, lon1]}}).encode())
+                    "area": self._area_json()}).encode())
                 return
-            update_command("go", (float(t_lat), float(t_lon)))
+            with CMD_LOCK:
+                MISSION["active"] = False
+                MISSION["idx"] = -1
+            update_command("go", (t_lat, t_lon))
             self._send(200, json.dumps({"ok": True, "mode": "go", "target": [t_lat, t_lon],
-                                        **CTRL}).encode())
+                                        "ctrl": dict(CTRL)}).encode())
         elif action == "hold":
-            est = STATE["estimated"]
+            with STATE_LOCK:
+                est = STATE["estimated"]
             if est is None:
                 self._send(409, json.dumps({"ok": False, "error": "no visual fix yet to hold"}).encode())
                 return
+            with CMD_LOCK:
+                MISSION["active"] = False
+                MISSION["idx"] = -1
             update_command("hold", (est["lat"], est["lon"]))
-            self._send(200, json.dumps({"ok": True, "mode": "hold", "target": [est["lat"], est["lon"]]}).encode())
+            self._send(200, json.dumps({"ok": True, "mode": "hold",
+                                        "target": [est["lat"], est["lon"]]}).encode())
         elif action == "stop":
+            with CMD_LOCK:
+                MISSION["active"] = False
+                MISSION["idx"] = -1
             update_command("idle")
             self._send(200, json.dumps({"ok": True, "mode": "idle"}).encode())
         else:
-            self._send(400, json.dumps({"ok": False, "error": "unknown action (go|hold|stop)"}).encode())
+            self._send(400, json.dumps({"ok": False,
+                                        "error": "unknown action (go|hold|stop)"}).encode())
+
+    def handle_calibrate(self, req):
+        """
+        POST /calibrate {"lat":.., "lon":..}
+        The operator types the drone's REAL current coordinate (read from a
+        map, a hand-held GPS, or the DJI app when it has a fix). We compute
+        the difference against the raw visual fix and shift every future
+        fix by it. The closed loop keeps running on tile matching only —
+        this is a one-time anchor correction, not GPS input.
+        """
+        action = str(req.get("action", "set")).lower()
+        with CMD_LOCK:
+            old = dict(CAL_OFFSET)
+        if action in ("clear", "reset"):
+            with CMD_LOCK:
+                CAL_OFFSET.update(dlat=0.0, dlon=0.0, enabled=False)
+            self._send(200, json.dumps({"ok": True, "cal_offset": dict(CAL_OFFSET)}).encode())
+            return
+
+        with STATE_LOCK:
+            est = STATE["estimated"]
+        if est is None:
+            self._send(409, json.dumps({"ok": False,
+                                        "error": "no visual fix yet to calibrate"}).encode())
+            return
+        try:
+            lat = float(req["lat"]); lon = float(req["lon"])
+        except (KeyError, TypeError, ValueError):
+            self._send(400, json.dumps({"ok": False, "error": "need numeric lat/lon"}).encode())
+            return
+        if not in_area(lat, lon):
+            self._send(400, json.dumps({"ok": False,
+                                        "error": "coordinate outside the loaded tile area",
+                                        "area": self._area_json()}).encode())
+            return
+        raw_lat = est["lat"] - old["dlat"]
+        raw_lon = est["lon"] - old["dlon"]
+        dlat, dlon = lat - raw_lat, lon - raw_lon
+        with CMD_LOCK:
+            CAL_OFFSET.update(dlat=dlat, dlon=dlon, enabled=True)
+        dm = math.hypot(dlat * M_LAT,
+                        dlon * M_LAT * math.cos(math.radians(lat)))
+        self._send(200, json.dumps({
+            "ok": True, "mode": "calibrated",
+            "cal_offset": {"dlat": dlat, "dlon": dlon, "enabled": True},
+            "offset_m": round(dm, 2),
+            "current": [lat, lon],
+        }).encode())
+
+    def handle_mission(self, req):
+        action = str(req.get("action", "set")).lower()
+        if action == "clear":
+            with CMD_LOCK:
+                MISSION["points"] = []
+                MISSION["idx"] = -1
+                MISSION["active"] = False
+            update_command("idle")
+            self._send(200, json.dumps({"ok": True, "mission": mission_payload()}).encode())
+            return
+        if action in ("start", "set"):
+            if action == "set" or "points" in req:
+                pts = req.get("points", [])
+                if not isinstance(pts, list) or not pts:
+                    self._send(400, json.dumps({"ok": False,
+                                                "error": "points must be a non-empty list"}).encode())
+                    return
+                clean = []
+                for i, p in enumerate(pts):
+                    try:
+                        p_lat, p_lon = float(p[0]), float(p[1])
+                    except (TypeError, ValueError, IndexError):
+                        self._send(400, json.dumps({"ok": False,
+                                                    "error": f"point {i} needs [lat, lon]"}).encode())
+                        return
+                    if not in_area(p_lat, p_lon):
+                        self._send(400, json.dumps({
+                            "ok": False,
+                            "error": f"point {i} outside the loaded tile area",
+                            "area": self._area_json()}).encode())
+                        return
+                    clean.append((p_lat, p_lon))
+                with CMD_LOCK:
+                    MISSION["points"] = clean
+                    MISSION["idx"] = -1
+                    MISSION["active"] = False
+            with CMD_LOCK:
+                if not MISSION["points"]:
+                    self._send(400, json.dumps({"ok": False,
+                                                "error": "mission has no points"}).encode())
+                    return
+                MISSION["idx"] = 0
+                MISSION["active"] = True
+                first = tuple(MISSION["points"][0])
+            update_command("go", first)
+            self._send(200, json.dumps({"ok": True, "mode": "mission",
+                                        "mission": mission_payload()}).encode())
+            return
+        if action == "skip":
+            with CMD_LOCK:
+                active = MISSION["active"]
+                has_next = MISSION["idx"] + 1 < len(MISSION["points"])
+                if active and has_next:
+                    MISSION["idx"] += 1
+                    nxt = tuple(MISSION["points"][MISSION["idx"]])
+                elif active:
+                    MISSION["active"] = False
+                    MISSION["idx"] = -1
+            if not active:
+                self._send(409, json.dumps({"ok": False,
+                                            "error": "no active mission"}).encode())
+                return
+            if not has_next:
+                update_command("idle")
+                self._send(200, json.dumps({"ok": True, "mode": "complete",
+                                            "mission": mission_payload()}).encode())
+                return
+            update_command("go", nxt)
+            self._send(200, json.dumps({"ok": True, "mode": "mission",
+                                        "mission": mission_payload()}).encode())
+            return
+        self._send(400, json.dumps({"ok": False,
+                                    "error": "unknown mission action (set|start|clear|skip)"}).encode())
+
+    def handle_settings(self, req):
+        bounds = {"vmax": (0.2, 10.0), "kp": (0.05, 5.0),
+                  "stop_radius": (0.3, 20.0), "hold_deadband": (0.0, 2.0)}
+        updates = {}
+        for key, (lo, hi) in bounds.items():
+            if key in req:
+                try:
+                    val = float(req[key])
+                except (TypeError, ValueError):
+                    self._send(400, json.dumps({"ok": False,
+                                                "error": f"{key} must be a number"}).encode())
+                    return
+                if not (lo <= val <= hi):
+                    self._send(400, json.dumps({"ok": False,
+                                                "error": f"{key} outside [{lo}, {hi}]"}).encode())
+                    return
+                updates[key] = val
+        with CMD_LOCK:
+            CTRL.update(updates)
+        self._send(200, json.dumps({"ok": True, "ctrl": dict(CTRL)}).encode())
 
 
 # ============================================================

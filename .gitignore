@@ -1,3 +1,10 @@
 
 sim_tiles_*/
+simulation_output*/
 __pycache__/
+
+# generated previews / screenshots (not part of the source)
+pc_bridge/_map_*.png
+pc_bridge/_map_preview.png
+pc_bridge/_gui_screenshot.png
+

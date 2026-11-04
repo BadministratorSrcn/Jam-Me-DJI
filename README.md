@@ -30,28 +30,36 @@ telemetry to the PC, and consumes the visual fix back over HTTP:
 
 ```
 ┌─────────────────────────┐         ┌────────────────────────────────┐
-│ Android (RC-2/N-2 phone)│   WiFi  │ Ground PC                      │
+│ Android (RC-N2/N3 phone)│   WiFi  │ Ground PC                      │
 │  Jam-Me-DJI app         │         │  bridge_server.py              │
 │  ├ MSDK V5 (Mini 4 Pro) │◄────────┤  ├ RTMP ingest (ffmpeg)        │
 │  ├ LiveStreamManager ───┼─RTMP───►│  ├ visual core (submodule):    │
 │  │    RTMP out          │         │  │  TileLocalizer+Kalman        │
-│  ├ telemetry recorder   │         │  └ HTTP API /status /snapshot  │
-│  ├ VisualPosClient ─────┼──HTTP──►│                                │
-│  └ HUD overlay + CSV log│         └────────────────────────────────┘
-│     (DJI pos vs visual) │
-└─────────────────────────┘
+│  ├ telemetry recorder   │         │  ├ GPS-free controller         │
+│  ├ VisualPosClient ─────┼──HTTP──►│  │  go / hold / mission        │
+│  └ VirtualStickRunner   │         │  └ control_gui.py (operator)   │
+│     (10 Hz /drive)      │         │     map · camera · calibration │
+└─────────────────────────┘         └────────────────────────────────┘
 ```
 
 Ground PC runs against pre-loaded satellite tiles (`sim_tiles_*` /
-`tiles/` from the Pi repo flow — same format).
+`tiles/` from the Pi repo flow — same format). The operator can fly the
+whole mission from the PC: click a destination on the satellite map,
+press GO, or queue waypoints.
 
-**Honest mission profile on DJI:** with GPS present → normal MSDK
-missions/waypoints; when GPS degrades → DJI firmware rules apply (drone
-holds/RTHs per its own vision system) while our stack **continues to
-report the true visual position, logs the divergence, and geotags
-evidence** — it cannot override DJI's flight control. Direct visual
-drive would be the Mavic-3E/Matriceenterprise + PSDK/MAVSDK story, not
-Mini 4 Pro.
+**Control loop:** the bridge computes body-frame velocities from the
+visual fix only (`/drive`), the phone sends them through DJI virtual
+stick. If the visual fix goes stale, the bridge publishes **zero
+velocities** and flags `blind` — there is no blind flight mode.
+
+**Honest mission profile on DJI:** the GPS-free servo is implemented and
+tested against the simulator, but DJI firmware still gates virtual-stick
+control on its own positioning state. With GPS present → normal
+operation; when GPS degrades → DJI may hold/RTH and refuse API
+navigation. Our stack then reports the true visual position, logs the
+divergence, and keeps the last safe command at zero velocity. Direct
+visual drive without this gate would be the Mavic-3E/Matrice enterprise
++ PSDK/MAVSDK story, not Mini 4 Pro.
 
 ---
 
@@ -59,29 +67,43 @@ Mini 4 Pro.
 
 | Path | What it is |
 |---|---|
-| `pc_bridge/` | Ground PC: RTMP ingest → visual core → HTTP API (Python; reuses `common.py`/`main_tile.py` via git submodule) |
-| `app/` | Android Kotlin MSDK V5 app skeleton (registration, RTMP stream start, telemetry recorder, visual-position client & HUD) |
-| `docs/ARCHITECTURE.md` | Data flows, message schema, DJI constraints detail, phase-2 (Kotlin port) plan |
+| `pc_bridge/` | Ground PC: RTMP ingest → visual core → GPS-free controller → HTTP API (Python; reuses `common.py`/`main_tile.py` via git submodule) |
+| `pc_bridge/control_gui.py` | Tactical operator console: live camera, satellite map, click-to-go, position calibration, waypoint missions |
+| `app/` | Android Kotlin MSDK V5 app skeleton (registration, RTMP stream start, telemetry recorder, visual-position client, virtual-stick runner) |
+| `docs/ARCHITECTURE.md` | Data flows, message schema, control loop, DJI constraints detail, phase-2 (Kotlin port) plan |
 
 ## Quick start (PC part — works today, no drone needed)
 
 ```bash
-git clonehttps://github.com/BadministratorSrcn/Jam-Me.git pc_bridge/core
-# (placeholder: git submodule init once repo is published)
+git clone --recurse-submodules https://github.com/BadministratorSrcn/Jam-Me-DJI.git
 python -m pip install -r pc_bridge/requirements.txt
 
 # offline demo — bridge consumes the SIMULATED flight (same pipeline!)
 python pc_bridge/bridge_server.py --source sim \
-    --tiles-dir pc_bridge/../sim_tiles_diyarbakir --port 8080
-# then open http://127.0.0.1:8080/status  and /snapshot
+    --tiles-dir C:\path\to\Jam-Me\sim_tiles_diyarbakir --port 8080
+
+# operator console (second terminal)
+python pc_bridge/control_gui.py \
+    --tiles-dir C:\path\to\Jam-Me\sim_tiles_diyarbakir --port 8080
 ```
 
-Real drone: the RTMP URL from the Android app (`rtmp://<pc-ip>:8081/live`)
+Click anywhere on the map to pick a target, press **GO**, and watch the
+virtual drone fly there using tile matching alone. `HOLD` station-keeps
+on the current fix, `STOP` zeroes velocities. Mission queue, speed limit
+and manual position calibration are on the right panel.
+
+Need tiles first? In the Jam-Me repo:
+
+```bash
+python simulate.py --mode real --tiles-dir sim_tiles_myarea --no-wait
+```
+
+Real drone: the RTMP URL from the Android app (`rtmp://<pc-ip>:1935/live`)
 is ingested automatically:
 
 ```bash
 python pc_bridge/bridge_server.py --source rtmp://127.0.0.1:1935/live --port 8080
-# ffmpeg required on PATH (or --ffmpeg path)
+# ffmpeg required on PATH (or --ff-path); run mediamtx (or similar) at 1935
 ```
 
 ## Quick start (Android part)
@@ -99,8 +121,12 @@ python pc_bridge/bridge_server.py --source rtmp://127.0.0.1:1935/live --port 808
 ## Status / roadmap
 
 - [x] PC bridge (RTMP ingest + visual core + HTTP API) — works offline & online
+- [x] Tactical PC console (map click-to-go, camera HUD, calibration, mission queue)
+- [x] GPS-free position servo (GO / HOLD, stale-fix zero-velocity watchdog)
+- [x] Manual current-position anchoring (`/calibrate`) and two-point+ missions
 - [x] Android skeleton (registration/live stream/telemetry/HUD)
-- [ ] WaypointMission runner (GPS-mode missions via MSDK)
+- [ ] Wire real MSDK virtual-stick calls (needs AARs in `app/libs`; signs must be verified on the bench)
+- [ ] GPS-mode MSDK WaypointMission runner
 - [ ] EXIF geotagging of recorded media with visual fix
 - [ ] Phase 2: Kotlin port of visual core (when DJI fixes Mini 4 Pro `VideoFeed`)
 - [ ] Optional: enterprise aircraft (Mavic 3E etc.) branch with PSDK position feed
