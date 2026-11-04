@@ -1,4 +1,4 @@
-package com.jamme.dji
+package com.tactical.pilot
 
 /**
  * Starts/pauses the Mini 4 Pro camera live streaming toward the ground

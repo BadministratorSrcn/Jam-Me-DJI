@@ -14,15 +14,15 @@
 
     <application
         android:name=".App"
-        android:label="Jam-Me DJI"
+        android:label="Tactical Pilot"
         android:theme="@android:style/Theme.Material.Light"
         android:allowBackup="false">
 
-        <!-- >>> PASTE YOUR DJI DEVELOPER APP KEY & PACKAGE NAME FROM
-             https://developer.dji.com (create an MSDK V5 app there, free) -->
+        <!-- DJI Developer App Key for App "Tactical Pilot"
+             (package com.tactical.pilot — matches applicationId) -->
         <meta-data
             android:name="com.dji.sdk.API_KEY"
-            android:value="PASTE_YOUR_APP_KEY_HERE" />
+            android:value="dff381b608c20a4e62589660" />
 
         <activity
             android:name=".MainActivity"

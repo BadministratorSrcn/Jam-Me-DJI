@@ -15,5 +15,5 @@ dependencyResolutionManagement {
         flatDir { dirs("app/libs") }
     }
 }
-rootProject.name = "JamMeDJI"
+rootProject.name = "TacticalPilot"
 include(":app")

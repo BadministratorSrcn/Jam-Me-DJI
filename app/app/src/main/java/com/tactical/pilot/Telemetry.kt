@@ -1,4 +1,4 @@
-package com.jamme.dji
+package com.tactical.pilot
 
 /**
  * Registers MSDK telemetry keys and keeps VisualPosClient's DJI-GPS fields

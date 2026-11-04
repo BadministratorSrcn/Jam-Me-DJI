@@ -1,4 +1,4 @@
-package com.jamme.dji
+package com.tactical.pilot
 
 import java.net.HttpURLConnection
 import java.net.URL

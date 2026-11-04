@@ -1,4 +1,4 @@
-package com.jamme.dji
+package com.tactical.pilot
 
 import android.app.Application
 import android.content.Context

@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.jamme.dji"
+    namespace = "com.tactical.pilot"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.jamme.dji"
+        applicationId = "com.tactical.pilot"   // must match the MSDK App Key registration
         minSdk = 24
         targetSdk = 34
         versionCode = 1
