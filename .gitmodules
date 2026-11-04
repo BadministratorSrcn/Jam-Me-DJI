@@ -1,0 +1,3 @@
+[submodule "pc_bridge/core"]
+	path = pc_bridge/core
+	url = https://github.com/BadministratorSrcn/Jam-Me.git
