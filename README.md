@@ -98,15 +98,20 @@ Need tiles first? In the Jam-Me repo:
 python simulate.py --mode real --tiles-dir sim_tiles_myarea --no-wait
 ```
 
-Real drone: start the whole PC stack (mediamtx + bridge + GUI) with the
-launcher, then follow [`docs/REAL_FLIGHT.md`](docs/REAL_FLIGHT.md):
+Real drone: the current field path uses **RTSP from the phone**, a local
+MJPEG console feed, and an optional **Google Maps JavaScript** window
+(WebView2). Follow [`docs/REAL_FLIGHT.md`](docs/REAL_FLIGHT.md):
 
 ```powershell
-.\pc_bridge\run_real.ps1 -TilesDir C:\path\to\Jam-Me\sim_tiles_diyarbakir
+$env:GOOGLE_MAPS_API_KEY="<Maps JavaScript API key>"
+.\pc_bridge\run_real.ps1 -TilesDir C:\path\to\Jam-Me\sim_tiles_diyarbakir `
+  -Source "rtsp://jamme:jamme@<phone-ip>:8554/streaming/live/1" `
+  -MapProvider google
 ```
 
-The Android app publishes `rtmp://<pc-ip>:1935/live`; the bridge ingests it
-with ffmpeg.
+The phone shows the exact RTSP URL in its log (`Live555 gen url: ...`).
+RTMP + mediamtx remains a fallback (use mediamtx **v1.9.3**; newer builds
+fail DJI's librtmp handshake).
 
 ## Quick start (Android part)
 
@@ -115,8 +120,8 @@ download is needed:
 
 ```kotlin
 implementation("com.dji:dji-sdk-v5-aircraft:5.18.0")
-implementation("com.dji:dji-sdk-v5-aircraft-provided:5.18.0")
-implementation("com.dji:dji-sdk-v5-networkImp:5.18.0")
+compileOnly("com.dji:dji-sdk-v5-aircraft-provided:5.18.0")
+runtimeOnly("com.dji:dji-sdk-v5-networkImp:5.18.0")
 ```
 
 The App Key `dff381b608c20a4e62589660` and package `com.tactical.pilot` are

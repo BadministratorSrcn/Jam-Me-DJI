@@ -1,6 +1,7 @@
 package com.tactical.pilot
 
 import android.app.Activity
+import android.net.ConnectivityManager
 import android.os.Bundle
 import android.text.InputType
 import android.view.View
@@ -10,6 +11,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.net.Inet4Address
 import dji.sdk.keyvalue.key.GimbalKey
 import dji.sdk.keyvalue.key.KeyTools
 import dji.sdk.keyvalue.value.common.ComponentIndexType
@@ -19,7 +21,6 @@ import dji.sdk.keyvalue.value.gimbal.GimbalAngleRotationMode
 import dji.v5.common.callback.CommonCallbacks
 import dji.v5.common.error.IDJIError
 import dji.v5.manager.KeyManager
-import dji.v5.manager.SDKManager
 
 /**
  * Tactical Pilot HUD.
@@ -83,6 +84,7 @@ class MainActivity : Activity() {
 
         val connectBtn = Button(this).apply { text = "CONNECT TO PC" }
         streamBtn = Button(this).apply { text = "RTMP STREAM: START" }
+        val rtspBtn = Button(this).apply { text = "RTSP STREAM (PHONE SERVER)" }
         val gimbalBtn = Button(this).apply { text = "CAMERA: POINT DOWN (-90°)" }
         armBtn = Button(this).apply { text = "PC CONTROL: ARM" }
         val retryBtn = Button(this).apply { text = "RETRY MSDK REGISTER" }
@@ -103,6 +105,7 @@ class MainActivity : Activity() {
             addView(telemetryView)
             addView(posView)
             addView(streamBtn)
+            addView(rtspBtn)
             addView(gimbalBtn)
             addView(armBtn)
             addView(retryBtn)
@@ -124,9 +127,20 @@ class MainActivity : Activity() {
             }
         }
         gimbalBtn.setOnClickListener { pointCameraDown() }
+        rtspBtn.setOnClickListener {
+            val url = "rtsp://jamme:jamme@${localWifiIp()}:8554/live"
+            rtmpEdit.setText(url)
+            status.logLine("RTSP mode: $url")
+            val s = streamer ?: DicLiveStreamer().also { streamer = it }
+            // Ensure-running: never stop/start on every tap; the SDK reports
+            // LIVE_STREAM_ALREADY_STARTED if it is already live.
+            s.start(url) { ok ->
+                runOnUiThread { streamBtn.text = "RTSP STREAM: ${if (ok) "RUNNING" else "START"}" }
+            }
+        }
         retryBtn.setOnClickListener {
             try {
-                SDKManager.getInstance().registerApp()
+                SdkBootstrap.retryRegister()
                 status.logLine("MSDK registerApp() retry requested")
             } catch (e: Throwable) {
                 status.logLine("registerApp retry failed: ${e.message?.take(70)}")
@@ -242,6 +256,17 @@ class MainActivity : Activity() {
     }
 
     private fun ageText(ms: Long): String = if (ms == Long.MAX_VALUE) "—" else "$ms ms"
+
+    /** Wi-Fi IPv4 address the phone's RTSP server will bind to. */
+    private fun localWifiIp(): String = try {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        val link = cm.getLinkProperties(cm.activeNetwork)
+        link?.linkAddresses
+            ?.firstOrNull { it.address is Inet4Address && !it.address.isLoopbackAddress }
+            ?.address?.hostAddress ?: "192.168.1.104"
+    } catch (_: Exception) {
+        "192.168.1.104"
+    }
 
     override fun onDestroy() {
         uiAlive = false

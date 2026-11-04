@@ -68,6 +68,7 @@ STATE = {
     "frame": None,            # latest BGR frame for /snapshot
     "err_m": None,
     "tiles_loaded": 0,
+    "dji": None,              # reference-only DJI GPS (never used for control)
 }
 STATE_LOCK = threading.Lock()
 SIM_NOW = {"t": 0.0}
@@ -247,9 +248,13 @@ class RtmpSource:
         self._spawn()
 
     def _spawn(self):
+        if self.url.startswith("rtsp"):
+            proto = ["-rtsp_transport", "tcp", "-timeout", "5000000"]
+        else:
+            proto = ["-rw_timeout", "5000000"]
         cmd = [
             self.ffmpeg, "-hide_banner", "-loglevel", "error",
-            "-rw_timeout", "5000000",
+        ] + proto + [
             "-i", self.url,
             "-vf", f"scale={self.frame_w}:{self.frame_h}:force_original_aspect_ratio=decrease,"
                    f"pad={self.frame_w}:{self.frame_h}:(ow-iw)/2:(oh-ih)/2",
@@ -374,17 +379,48 @@ def worker(cfg, src, exit_evt, dt=0.25):
     log.info(f"initial tile: {ok}" if ok else "initial localization FAILED")
     last_init_try = time.time()
 
+    # Decouple video delivery from visual matching: the grabber keeps the
+    # latest frame flowing to the GUI at source rate, while the worker
+    # localizes at its own (slower) rate. The scripted simulator keeps its
+    # single-threaded read/step loop so its physics stays deterministic.
+    use_grabber = not isinstance(src, SimSource)
+    latest = {"frame": None, "seq": 0}
+
+    def _grab():
+        while not exit_evt.is_set():
+            f = src.read()
+            if f is None:
+                with STATE_LOCK:
+                    STATE["fix_valid"] = False
+                run_controller(None, None)
+                exit_evt.wait(0.05)
+                continue
+            with STATE_LOCK:
+                STATE["frame"] = f.copy()
+            latest["frame"] = f
+            latest["seq"] += 1
+
+    if use_grabber:
+        threading.Thread(target=_grab, daemon=True).start()
+
+    last_seq = -1
     last_fix_clock = -1e9
     while not exit_evt.is_set():
-        frame = src.read()
-        if frame is None:
-            # Stream stalled/ended: fail safe immediately instead of keeping
-            # the previous moving command alive.
-            with STATE_LOCK:
-                STATE["fix_valid"] = False
-            run_controller(None, None)
-            exit_evt.wait(0.1)
-            continue
+        if use_grabber:
+            frame = latest["frame"]
+            seq = latest["seq"]
+            if frame is None or seq == last_seq:
+                exit_evt.wait(0.02)
+                continue
+            last_seq = seq
+        else:
+            frame = src.read()
+            if frame is None:
+                with STATE_LOCK:
+                    STATE["fix_valid"] = False
+                run_controller(None, None)
+                exit_evt.wait(0.1)
+                continue
 
         # The first frame may be a boot screen or a forward-facing camera
         # before the gimbal is pointed down. Keep retrying the global initial
@@ -398,7 +434,6 @@ def worker(cfg, src, exit_evt, dt=0.25):
                     log.info("initial localization acquired on retry")
             if not ok:
                 with STATE_LOCK:
-                    STATE["frame"] = frame.copy()
                     STATE["fix_valid"] = False
                 run_controller(None, None)
                 continue
@@ -482,11 +517,67 @@ class ApiHTTP(BaseHTTPRequestHandler):
             return None
         return {"lat": list(AREA_BOX[0]), "lon": list(AREA_BOX[1])}
 
+    def _google_map_html(self):
+        """Serve the Google Maps JavaScript page with the key injected."""
+        path = os.path.join(HERE, "google_map.html")
+        with open(path, "r", encoding="utf-8") as f:
+            doc = f.read()
+        key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+        if AREA_BOX:
+            lat = (AREA_BOX[0][0] + AREA_BOX[0][1]) / 2.0
+            lon = (AREA_BOX[1][0] + AREA_BOX[1][1]) / 2.0
+        else:
+            lat, lon = 37.9073, 40.2389
+        return (doc
+                .replace("__GOOGLE_MAPS_API_KEY__", key)
+                .replace("__KEY_PRESENT__", "true" if key else "false")
+                .replace("__CENTER_LAT__", f"{lat:.7f}")
+                .replace("__CENTER_LON__", f"{lon:.7f}")
+                .replace("__ZOOM__", "15"))
+
+    def _stream_mjpeg(self):
+        """Continuous multipart JPEG stream for the local GUI (low latency)."""
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            while True:
+                with STATE_LOCK:
+                    frame = STATE.get("frame")
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
+                ok, jpg = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if not ok:
+                    continue
+                data = jpg.tobytes()
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(
+                    b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n")
+                self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.03)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/stream.mjpg":
+            self._stream_mjpeg()
+            return
+        if path == "/map":
+            self._send(200, self._google_map_html().encode("utf-8"), "text/html")
+            return
         with STATE_LOCK:
             wall_age = time.time() - STATE.get("wall_update", 0.0)
             fresh = wall_age <= STATE.get("fix_timeout", 1.0)
+            dji = STATE.get("dji")
             state = {
                 "ts": STATE["ts"],
                 "age_s": (round(max(0.0, time.time() - STATE["ts"]), 2)
@@ -495,6 +586,8 @@ class ApiHTTP(BaseHTTPRequestHandler):
                 "estimated": STATE["estimated"],
                 "fix_valid": STATE["fix_valid"] and fresh,
                 "tiles_loaded": STATE["tiles_loaded"],
+                "dji": dji,
+                "dji_age_s": (round(time.time() - dji["ts"], 2) if dji else None),
             }
         if path == "/status":
             state["ctrl"] = dict(CTRL)
@@ -552,8 +645,28 @@ class ApiHTTP(BaseHTTPRequestHandler):
             self.handle_mission(req)
         elif path == "/settings":
             self.handle_settings(req)
+        elif path == "/telemetry":
+            self.handle_telemetry(req)
         else:
             self._send(404, b'{"error":"not found"}')
+
+    def handle_telemetry(self, req):
+        """Reference-only DJI GPS from the phone; never feeds the controller."""
+        try:
+            lat = float(req.get("lat"))
+            lon = float(req.get("lon"))
+        except (TypeError, ValueError):
+            self._send(400, json.dumps({"ok": False, "error": "lat/lon required"}).encode())
+            return
+        with STATE_LOCK:
+            STATE["dji"] = {
+                "lat": lat, "lon": lon,
+                "heading": req.get("heading"),
+                "alt": req.get("alt"),
+                "sats": req.get("sats"),
+                "ts": time.time(),
+            }
+        self._send(200, b'{"ok":true}')
 
     # ---- POST endpoints -----------------------------------------
     def handle_command(self, req):
@@ -811,7 +924,7 @@ def main():
     if args.source == "sim":
         src = SimSource(args.tiles_dir, duration=args.sim_duration,
                         speed=args.sim_speed, dt=args.sim_dt)
-    elif args.source.startswith("rtmp"):
+    elif args.source.startswith(("rtmp", "rtsp")):
         src = RtmpSource(args.source, ffmpeg=args.ff_path)
     elif args.source.startswith("file:"):
         src = FileSource(args.source[5:])

@@ -1,5 +1,7 @@
 opencv-python>=4.8
 numpy>=1.24
-# ffmpeg (binary, not pip) is REQUIRED only for `--source rtmp://...`
+# Optional Google Maps window (WebView2 backend on Windows)
+pywebview>=5
+# ffmpeg (binary, not pip) is REQUIRED for RTSP/RTMP sources
 #   Windows: winget install ffmpeg
 #   Linux:   sudo apt install ffmpeg

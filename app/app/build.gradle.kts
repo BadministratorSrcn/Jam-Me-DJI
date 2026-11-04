@@ -10,7 +10,7 @@ android {
     defaultConfig {
         applicationId = "com.tactical.pilot"   // must match the MSDK App Key registration
         minSdk = 24
-        targetSdk = 35
+        targetSdk = 34
         versionCode = 1
         versionName = "0.1"
     }

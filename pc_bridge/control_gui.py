@@ -37,8 +37,11 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import tkinter as tk
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -105,10 +108,11 @@ class BridgeClient:
 class BridgePoller(threading.Thread):
     """Polls /status + /drive + /snapshot without blocking the UI."""
 
-    def __init__(self, client, interval=0.25):
+    def __init__(self, client, interval=0.10, direct_video=False):
         super().__init__(daemon=True)
         self.client = client
         self.interval = interval
+        self.direct_video = direct_video
         self.stop_evt = threading.Event()
         self.lock = threading.Lock()
         self.status = {}
@@ -126,7 +130,7 @@ class BridgePoller(threading.Thread):
             online = not st.get("_offline", False)
             snap = None
             now = time.monotonic()
-            if online and now - last_snap >= 0.45:
+            if online and not self.direct_video and now - last_snap >= 0.10:
                 snap = self.client.snapshot_jpeg()
                 last_snap = now
             with self.lock:
@@ -144,6 +148,59 @@ class BridgePoller(threading.Thread):
             return (dict(self.status), dict(self.drive),
                     self.snapshot, self.snapshot_seq,
                     self.online, self.last_error)
+
+
+# =============================================================
+# DIRECT RTSP VIDEO (bypasses the JPEG snapshot bottleneck)
+# =============================================================
+class RtspVideo(threading.Thread):
+    def __init__(self, url, width=640, height=480):
+        super().__init__(daemon=True)
+        self.url = url
+        self.width, self.height = width, height
+        self.stop_evt = threading.Event()
+        self.lock = threading.Lock()
+        self.frame = None
+        self.seq = 0
+
+    def run(self):
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+        cap = None
+        while not self.stop_evt.is_set():
+            if cap is None:
+                cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                if not cap.isOpened():
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = None
+                    self.stop_evt.wait(1.0)
+                    continue
+            ok, frame = cap.read()
+            if not ok:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = None
+                self.stop_evt.wait(0.3)
+                continue
+            if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                frame = cv2.resize(frame, (self.width, self.height))
+            with self.lock:
+                self.frame = frame
+                self.seq += 1
+            time.sleep(0.005)
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+    def read(self):
+        with self.lock:
+            return self.frame, self.seq
 
 
 # =============================================================
@@ -247,6 +304,213 @@ class GeoMap:
 
 
 # =============================================================
+# DYNAMIC TILE PROVIDER (ESRI now / Google Map Tiles when enabled)
+# =============================================================
+class TileProvider:
+    """Fetches 256px Web-Mercator tiles for the visible map view.
+
+    The GUI keeps its existing pan/zoom and overlays; only the base image
+    changes. Missing tiles are requested in the background and the map
+    redraws when they arrive. Google Map Tiles needs a session token and
+    GOOGLE_MAPS_API_KEY in the environment.
+    """
+
+    ESRI = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}")
+    GOOGLE = ("https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}"
+              "?session={session}&key={key}")
+
+    def __init__(self, gmap, provider="esri", api_key="", cache_dir=None,
+                 max_cache=160):
+        self.gmap = gmap
+        self.provider = provider
+        self.api_key = api_key
+        self.max_cache = max_cache
+        self.cache_dir = cache_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "map_cache", provider)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache = OrderedDict()
+        self.pending = set()
+        self.lock = threading.Lock()
+        self.pool = ThreadPoolExecutor(max_workers=4)
+        self.session = None
+        self.ready = provider == "esri"
+        self.error = None
+        self.dirty = False
+        if provider == "google":
+            threading.Thread(target=self._init_google, daemon=True).start()
+
+    def _init_google(self):
+        try:
+            body = json.dumps({
+                "mapType": "satellite",
+                "language": "en-US",
+                "region": "US",
+            }).encode()
+            req = urllib.request.Request(
+                "https://tile.googleapis.com/v1/createSession?key="
+                + urllib.parse.quote(self.api_key, safe=""),
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read())
+            self.session = data.get("session")
+            self.ready = bool(self.session)
+            if self.ready:
+                self.dirty = True
+            else:
+                self.error = "no session token"
+        except Exception as e:
+            self.error = str(e)[:180]
+            self.ready = False
+
+    def _url(self, z, x, y):
+        if self.provider == "google":
+            return self.GOOGLE.format(
+                z=z, x=x, y=y,
+                session=urllib.parse.quote(self.session or "", safe=""),
+                key=urllib.parse.quote(self.api_key, safe=""))
+        return self.ESRI.format(z=z, y=y, x=x)
+
+    def _cache_path(self, z, x, y):
+        d = os.path.join(self.cache_dir, str(z), str(x))
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{y}.jpg")
+
+    def _get(self, z, x, y):
+        key = (z, x, y)
+        with self.lock:
+            img = self.cache.get(key)
+            if img is not None:
+                self.cache.move_to_end(key)
+                return img
+        path = self._cache_path(z, x, y)
+        if os.path.exists(path):
+            img = cv2.imread(path)
+            if img is not None:
+                self._put(key, img)
+                return img
+        return None
+
+    def _put(self, key, img):
+        with self.lock:
+            self.cache[key] = img
+            self.cache.move_to_end(key)
+            while len(self.cache) > self.max_cache:
+                self.cache.popitem(last=False)
+
+    def _request(self, z, x, y):
+        key = (z, x, y)
+        with self.lock:
+            if key in self.cache or key in self.pending:
+                return
+            self.pending.add(key)
+        self.pool.submit(self._fetch, z, x, y, key)
+
+    def _fetch(self, z, x, y, key):
+        try:
+            req = urllib.request.Request(
+                self._url(z, x, y),
+                headers={"User-Agent": "JAM-Me/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = r.read()
+            img = cv2.imdecode(np.frombuffer(data, np.uint8),
+                               cv2.IMREAD_COLOR)
+            if img is not None:
+                cv2.imwrite(self._cache_path(z, x, y), img,
+                            [cv2.IMWRITE_JPEG_QUALITY, 86])
+                self._put(key, img)
+                self.dirty = True
+        except Exception:
+            pass
+        finally:
+            with self.lock:
+                self.pending.discard(key)
+
+    @staticmethod
+    def _tile_bounds(z, x, y):
+        n = 2.0 ** z
+        lon_l = x / n * 360.0 - 180.0
+        lon_r = (x + 1) / n * 360.0 - 180.0
+        lat_t = math.degrees(math.atan(math.sinh(
+            math.pi * (1.0 - 2.0 * y / n))))
+        lat_b = math.degrees(math.atan(math.sinh(
+            math.pi * (1.0 - 2.0 * (y + 1) / n))))
+        return lat_t, lon_l, lat_b, lon_r
+
+    @staticmethod
+    def _deg2num(lat, lon, z):
+        n = 2.0 ** z
+        x = (lon + 180.0) / 360.0 * n
+        sin_lat = math.sin(math.radians(lat))
+        y = (0.5 - math.log((1.0 + sin_lat) / (1.0 - sin_lat)) /
+             (4.0 * math.pi)) * n
+        return x, y
+
+    def render(self, sx, sy, sw, sh, w, h, zoom):
+        if not self.ready:
+            return None
+        lat_t, lon_l = self.gmap.px_to_geo(sx, sy)
+        lat_b, lon_r = self.gmap.px_to_geo(sx + sw, sy + sh)
+        lat_mid = (lat_t + lat_b) / 2.0
+        mpp_canvas = self.gmap.mpp / max(zoom, 1e-9)
+        try:
+            z = int(round(math.log2(
+                156543.03392 * math.cos(math.radians(lat_mid)) /
+                max(mpp_canvas, 1e-9))))
+        except ValueError:
+            return None
+        z = max(3, min(20 if self.provider == "google" else 19, z))
+
+        x0, y0 = self._deg2num(lat_t, lon_l, z)
+        x1, y1 = self._deg2num(lat_b, lon_r, z)
+        n = 2 ** z
+        tx0 = max(0, min(n - 1, int(math.floor(x0))))
+        tx1 = max(0, min(n - 1, int(math.floor(x1))))
+        ty0 = max(0, min(n - 1, int(math.floor(y0))))
+        ty1 = max(0, min(n - 1, int(math.floor(y1))))
+
+        patch = np.full((h, w, 3), 16, np.uint8)
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(ty0, ty1 + 1):
+                t_lat, t_lon, b_lat, b_lon = self._tile_bounds(z, tx, ty)
+                px0, py0 = self.gmap.geo_to_px(t_lat, t_lon)
+                px1, py1 = self.gmap.geo_to_px(b_lat, b_lon)
+                cx0 = (px0 - sx) * zoom
+                cy0 = (py0 - sy) * zoom
+                cx1 = (px1 - sx) * zoom
+                cy1 = (py1 - sy) * zoom
+                fx0 = int(round(cx0))
+                fy0 = int(round(cy0))
+                fx1 = fx0 + max(1, int(round(cx1 - cx0))) + 1
+                fy1 = fy0 + max(1, int(round(cy1 - cy0))) + 1
+                ix0 = max(0, fx0)
+                iy0 = max(0, fy0)
+                ix1 = min(w, fx1)
+                iy1 = min(h, fy1)
+                if ix1 <= ix0 or iy1 <= iy0:
+                    continue
+                img = self._get(z, tx, ty)
+                if img is None:
+                    self._request(z, tx, ty)
+                    cv2.rectangle(patch, (ix0, iy0), (ix1, iy1),
+                                  (30, 34, 40), -1)
+                    continue
+                tw = max(1, fx1 - fx0)
+                th = max(1, fy1 - fy0)
+                interp = cv2.INTER_AREA if tw < img.shape[1] else cv2.INTER_LINEAR
+                resized = cv2.resize(img, (tw, th), interpolation=interp)
+                sx0 = ix0 - fx0
+                sy0 = iy0 - fy0
+                sx1 = sx0 + (ix1 - ix0)
+                sy1 = sy0 + (iy1 - iy0)
+                if sx1 > sx0 and sy1 > sy0:
+                    patch[iy0:iy1, ix0:ix1] = resized[sy0:sy1, sx0:sx1]
+        return patch
+
+
+# =============================================================
 # INTERACTIVE MAP CANVAS
 # =============================================================
 class MapCanvas(tk.Canvas):
@@ -268,6 +532,7 @@ class MapCanvas(tk.Canvas):
         self._drag = None
         self._moved = False
         self._overlays = True
+        self.tile_provider = None
 
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._drag_move)
@@ -324,6 +589,16 @@ class MapCanvas(tk.Canvas):
             return
         self._photo_key = key
 
+        if self.tile_provider is not None and self.tile_provider.ready:
+            patch = self.tile_provider.render(sx, sy, sw, sh, w, h, self.zoom)
+            if patch is not None:
+                self._photo = self._tk_image(patch)
+                self.delete("base")
+                self.create_image(0, 0, image=self._photo,
+                                  anchor="nw", tags="base")
+                self.tag_lower("base")
+                return
+
         x0 = int(math.floor(sx))
         y0 = int(math.floor(sy))
         x1 = int(math.ceil(sx + sw))
@@ -353,7 +628,7 @@ class MapCanvas(tk.Canvas):
         return tk.PhotoImage(data=ppm.tobytes())
 
     # ---- overlays ---------------------------------------------
-    def redraw_overlays(self, est, target, mission, drive):
+    def redraw_overlays(self, est, target, mission, drive, dji=None):
         self.delete("ov")
         view = self._view()
         w, h = view[0], view[1]
@@ -404,6 +679,28 @@ class MapCanvas(tk.Canvas):
                     self.create_text(mx + 5, my - 7, text=f"{dm:.0f} m / {brg:.0f}°",
                                      anchor="w", fill="#d9b38c",
                                      font=("Segoe UI", 8), tags="ov")
+
+        # DJI GPS reference marker (never used for control)
+        if dji:
+            try:
+                x, y = pt(dji["lat"], dji["lon"])
+                if -30 <= x <= w + 30 and -30 <= y <= h + 30:
+                    self.create_oval(x - 8, y - 8, x + 8, y + 8,
+                                     outline="#8fa3b8", width=2,
+                                     dash=(3, 2), tags="ov")
+                    self.create_line(x - 11, y, x + 11, y,
+                                     fill="#8fa3b8", width=1, tags="ov")
+                    self.create_line(x, y - 11, x, y + 11,
+                                     fill="#8fa3b8", width=1, tags="ov")
+                    self.create_text(x + 13, y - 10, text="DJI GPS (ref)",
+                                     anchor="w", fill="#9fb0c4",
+                                     font=("Segoe UI", 7), tags="ov")
+                    if est:
+                        ex, ey = pt(est["lat"], est["lon"])
+                        self.create_line(ex, ey, x, y, fill="#44515f",
+                                         width=1, dash=(2, 4), tags="ov")
+            except Exception:
+                pass
 
         # drone + heading
         if est:
@@ -606,7 +903,8 @@ def fmt_lon(v):
 # MAIN APPLICATION
 # =============================================================
 class TacticalApp:
-    def __init__(self, client: BridgeClient, tiles_dir: str):
+    def __init__(self, client: BridgeClient, tiles_dir: str, rtsp_url: str = "",
+                 map_provider: str = "local", google_api_key: str = ""):
         self.client = client
         self.root = tk.Tk()
         self.root.title("JAM-ME  ·  Tactical Pilot  ·  GPS-free visual navigation")
@@ -625,7 +923,10 @@ class TacticalApp:
         self._suspend_pos = False
         self._tick_count = 0
 
-        self.poller = BridgePoller(client)
+        self.poller = BridgePoller(client, direct_video=bool(rtsp_url))
+        self.video = RtspVideo(rtsp_url) if rtsp_url else None
+        if self.video is not None:
+            self.video.start()
         self.poller.start()
 
         sw = self.root.winfo_screenwidth()
@@ -648,12 +949,22 @@ class TacticalApp:
         self._build_body()
         self._build_statusbar()
 
+        self.tile_provider = None
+        if map_provider in ("esri", "google"):
+            key = google_api_key or os.environ.get("GOOGLE_MAPS_API_KEY", "")
+            if map_provider == "google" and not key:
+                self.msg("Google Maps: GOOGLE_MAPS_API_KEY missing — using local tiles")
+            else:
+                self.tile_provider = TileProvider(self.gmap, map_provider, key)
+                self.map.tile_provider = self.tile_provider
+                self.msg(f"dynamic map: {map_provider}")
+
         self.msg(f"map loaded: {self.gmap.n_tiles} tiles · "
                  f"{self.gmap.mpp:.2f} m/px mosaic")
         self.bind_keys()
 
         self._last_follow = False
-        self.root.after(120, self.refresh)
+        self.root.after(33, self.refresh)
 
     # ---- UI construction --------------------------------------
     def _build_topbar(self):
@@ -1266,6 +1577,8 @@ class TacticalApp:
     # ---- periodic refresh -------------------------------------
     def refresh(self):
         status, drive, snap, seq, online, err = self.poller.read()
+        if self.video is not None:
+            snap, seq = self.video.read()
         self.status = status
         self.drive = drive
         self._tick_count += 1
@@ -1281,6 +1594,9 @@ class TacticalApp:
 
         est = self.current_fix()
         valid = bool(status.get("fix_valid"))
+        if est and valid and not getattr(self, "_fix_centered", False):
+            self.map.center_on(est["lat"], est["lon"])
+            self._fix_centered = True
         if valid and est:
             self.fix_pill.configure(text=f"FIX VALID · {est.get('conf', 0) * 100:.0f}%",
                                     bg="#12351d", fg=GREEN)
@@ -1352,10 +1668,21 @@ class TacticalApp:
             self.map.center_on(est["lat"], est["lon"])
 
         # map & camera
-        self.map.redraw_overlays(est, self.target, status.get("mission") or {}, drive)
+        if (self.tile_provider is not None and
+                self.tile_provider.provider == "google" and
+                not self.tile_provider.ready and
+                self.tile_provider.error and
+                not getattr(self, "_google_err_shown", False)):
+            self.msg("Google Maps: " + self.tile_provider.error)
+            self._google_err_shown = True
+        if self.tile_provider is not None and self.tile_provider.dirty:
+            self.tile_provider.dirty = False
+            self.map.render_base(force=True)
+        self.map.redraw_overlays(est, self.target, status.get("mission") or {}, drive,
+                                 status.get("dji"))
         self.update_camera(snap, seq)
 
-        self.root.after(120, self.refresh)
+        self.root.after(33, self.refresh)
 
     def update_mission(self, mission):
         self.mission = mission
@@ -1395,8 +1722,16 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--tiles-dir", required=True,
                     help="tile directory (same one the bridge loaded)")
+    ap.add_argument("--rtsp-url", default="",
+                    help="optional direct RTSP URL for smooth 30 fps video")
+    ap.add_argument("--map-provider", default="local",
+                    choices=["local", "esri", "google"],
+                    help="local mosaic (default) or dynamic tiles")
+    ap.add_argument("--google-api-key", default="",
+                    help="prefer the GOOGLE_MAPS_API_KEY environment variable")
     args = ap.parse_args()
-    app = TacticalApp(BridgeClient(args.host, args.port), args.tiles_dir)
+    app = TacticalApp(BridgeClient(args.host, args.port), args.tiles_dir,
+                      args.rtsp_url, args.map_provider, args.google_api_key)
     app.root.mainloop()
 
 

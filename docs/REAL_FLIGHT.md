@@ -10,6 +10,78 @@ Bu belge, simülatörde doğrulanmış PC görsel çekirdeğini gerçek bir
 
 ---
 
+## 0. Güncel çalışan akış (Kasım 2026)
+
+Bu, sahada doğrulanan kurulumdur. Aşağıdaki eski RTMP bölümleri yedek
+fallback olarak kalır; güncel akış **RTSP + yerel MJPEG + Google Maps
+JavaScript (WebView2)** kullanır.
+
+### Telefon (Tactical Pilot)
+
+1. RC-N2 + Mini 4 Pro bağlı, DJI Fly kapalı.
+2. Uygulamada `MSDK REGISTERED` ve `product CONNECTED` görünmeli.
+3. **RTSP STREAM (PHONE SERVER)** düğmesine **bir kez** bas. Tekrar
+   basmayın; `LIVE_STREAM_ALREADY_STARTED` yayının zaten çalıştığını
+   gösterir.
+4. Uygulama logunda gerçek RTSP URL'si çıkar:
+   `rtsp://jamme:jamme@<telefon-ip>:8554/streaming/live/1`
+5. Kamera **-90°** (uygulamadaki CAMERA düğmesi).
+
+### PC — tek komut
+
+```powershell
+$env:GOOGLE_MAPS_API_KEY="<google-api-key>"
+cd C:\Users\LNx\Desktop\Opencode\Jam-Me-DJI
+.\pc_bridge\run_real.ps1 `
+  -TilesDir C:\Users\LNx\Desktop\Opencode\JAMME\sim_tiles_diyarbakir `
+  -Source "rtsp://jamme:jamme@192.168.1.104:8554/streaming/live/1" `
+  -MapProvider google
+```
+
+Bu komut:
+- bridge'i RTSP kaynağıyla başlatır (mediamtx gerekmez),
+- Tkinter kontrol konsolunu (canlı video + telemetri) açar,
+- Google Maps JavaScript penceresini (WebView2) açar.
+
+### Google Maps anahtarı
+
+- Anahtar **Maps JavaScript API** için açık olmalı; bu kurulumda çalışıyor.
+- Anahtar repoya yazılmaz; `GOOGLE_MAPS_API_KEY` ortam değişkeninden okunur.
+- Map Tiles API / Static Maps API gerekmez. (Sunucu tarafı karo katmanı
+  `--map-provider google` ile istenirse ayrıca Map Tiles API açılmalı.)
+- Anahtarı Google Cloud'da API ve IP kısıtlamasıyla koru; sohbette
+  göründüyse rotate et.
+
+### Video yolu
+
+```
+DJI kamera → telefon RTSP (31 fps, 720p) → bridge ffmpeg
+          → 640×480 BGR → /stream.mjpg (MJPEG)
+          → Tkinter LIVE DOWNLINK + Google Maps penceresinde kamera PiP
+```
+
+- GUI kamera görüntüsü `--rtsp-url http://127.0.0.1:8080/stream.mjpg` ile
+  doğrudan MJPEG'den gelir; snapshot/JPEG istek gecikmesi yok.
+- Google Maps penceresi `http://127.0.0.1:8080/map` sayfasını yükler;
+  kamera PiP'i aynı sayfada `/stream.mjpg`'yi canvas'a çizer.
+- Kaynak 31 fps olduğu için 60 fps mümkün değil; ~27–30 fps hedeflenir.
+
+### Görsel fix ve 100 m
+
+- Karo çözünürlüğü: 4 px/m = 0.25 m/px.
+- 100 m'de kamera GSD'si ~0.24 m/px; karo ile neredeyse 1:1.
+- Ölçek testi: 0.125–0.5 m/px aralığında eşleşme; 0.25 m/px'te
+  143 match / conf 0.91.
+- İlk uçuş: 50–100 m, kamera -90°, ışık ve dokulu zemin.
+- Fix yoksa/gecikirse bridge hızları sıfırlar; kör uçuş yok.
+
+### Drone kapalıyken
+
+Video, `/snapshot` ve `/stream.mjpg` boş kalır; bu normaldir. Drone açılıp
+RTSP yayını başlayınca köprü kareleri alır, fix ve kamera PiP döner.
+
+---
+
 ## 1. Donanım ve ağ
 
 - [ ] Mini 4 Pro + RC-N2 + USB-C kablo

@@ -12,6 +12,8 @@ import dji.v5.manager.datacenter.livestream.LiveStreamType
 import dji.v5.manager.datacenter.livestream.LiveVideoBitrateMode
 import dji.v5.manager.datacenter.livestream.StreamQuality
 import dji.v5.manager.datacenter.livestream.settings.RtmpSettings
+import dji.v5.manager.datacenter.livestream.settings.RtspSettings
+import java.net.URI
 
 /**
  * Streams the Mini 4 Pro camera to the ground PC through MSDK's
@@ -35,7 +37,7 @@ class DicLiveStreamer {
         }
 
         override fun onError(error: IDJIError) {
-            status.logLine("RTMP error: ${error.description()}")
+            status.logLine("STREAM error: ${error.description()}")
         }
     }
 
@@ -43,8 +45,8 @@ class DicLiveStreamer {
 
     fun statusText(): String = lastStatus
 
-    fun toggle(rtmpUrl: String, onState: (Boolean) -> Unit) {
-        if (running) stop(onState) else start(rtmpUrl, onState)
+    fun toggle(url: String, onState: (Boolean) -> Unit) {
+        if (running) stop(onState) else start(url, onState)
     }
 
     fun start(url: String, onState: (Boolean) -> Unit) {
@@ -52,11 +54,26 @@ class DicLiveStreamer {
             onState(true)
             return
         }
+        val isRtsp = url.startsWith("rtsp://", ignoreCase = true)
         try {
-            val settings = LiveStreamSettings.Builder()
-                .setLiveStreamType(LiveStreamType.RTMP)
-                .setRtmpSettings(RtmpSettings.Builder().setUrl(url).build())
-                .build()
+            val builder = LiveStreamSettings.Builder()
+            if (isRtsp) {
+                val uri = try { URI(url) } catch (_: Exception) { null }
+                val userInfo = uri?.userInfo?.split(":") ?: emptyList()
+                val port = uri?.port?.takeIf { it > 0 } ?: 8554
+                builder.setLiveStreamType(LiveStreamType.RTSP)
+                    .setRtspSettings(
+                        RtspSettings.Builder()
+                            .setUserName(userInfo.getOrNull(0) ?: "jamme")
+                            .setPassWord(userInfo.getOrNull(1) ?: "jamme")
+                            .setPort(port)
+                            .build()
+                    )
+            } else {
+                builder.setLiveStreamType(LiveStreamType.RTMP)
+                    .setRtmpSettings(RtmpSettings.Builder().setUrl(url).build())
+            }
+            val settings = builder.build()
 
             mgr.setLiveStreamSettings(settings)
             mgr.setVideoChannelType(VideoChannelType.PRIMARY_STREAM_CHANNEL)
@@ -68,19 +85,21 @@ class DicLiveStreamer {
             mgr.startStream(object : CommonCallbacks.CompletionCallback {
                 override fun onSuccess() {
                     running = true
-                    status.logLine("RTMP start OK -> $url")
+                    status.logLine("${if (isRtsp) "RTSP" else "RTMP"} start OK -> $url")
                     onState(true)
                 }
 
                 override fun onFailure(error: IDJIError) {
-                    running = false
-                    status.logLine("RTMP start FAILED: ${error.errorCode()} ${error.description()}")
-                    onState(false)
+                    val already = error.errorCode()
+                        ?.contains("ALREADY_STARTED", ignoreCase = true) == true
+                    running = already
+                    status.logLine("STREAM start FAILED: ${error.errorCode()} ${error.description()}")
+                    onState(already)
                 }
             })
         } catch (e: Exception) {
             running = false
-            status.logLine("RTMP start exception: ${e.message?.take(80)}")
+            status.logLine("STREAM start exception: ${e.message?.take(80)}")
             onState(false)
         }
     }
@@ -90,18 +109,18 @@ class DicLiveStreamer {
             mgr.stopStream(object : CommonCallbacks.CompletionCallback {
                 override fun onSuccess() {
                     running = false
-                    status.logLine("RTMP stopped")
+                    status.logLine("STREAM stopped")
                     onState(false)
                 }
 
                 override fun onFailure(error: IDJIError) {
-                    status.logLine("RTMP stop FAILED: ${error.description()}")
+                    status.logLine("STREAM stop FAILED: ${error.description()}")
                     onState(running)
                 }
             })
         } catch (e: Exception) {
             running = false
-            status.logLine("RTMP stop exception: ${e.message?.take(80)}")
+            status.logLine("STREAM stop exception: ${e.message?.take(80)}")
             onState(false)
         }
     }

@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JAM-ME — Google Maps</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #0b0f14; }
+  #map { height: 100%; width: 100%; }
+  .panel {
+    position: absolute; top: 12px; left: 12px; z-index: 5;
+    background: rgba(11,15,20,.88); color: #dbe4ee;
+    border: 1px solid #263140; border-radius: 8px;
+    padding: 10px 12px; font: 12px/1.45 Consolas, monospace;
+    min-width: 250px; box-shadow: 0 4px 18px rgba(0,0,0,.45);
+  }
+  .panel b { color: #fff; font-size: 14px; }
+  .ok { color: #3fb950; } .bad { color: #f85149; } .warn { color: #d29922; }
+  .muted { color: #7f8ea3; }
+  .controls {
+    position: absolute; left: 12px; bottom: 12px; z-index: 5;
+    display: flex; flex-direction: row; flex-wrap: wrap; align-items: center;
+    gap: 6px; background: rgba(11,15,20,.88); border: 1px solid #263140;
+    border-radius: 8px; padding: 8px; width: 360px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.45);
+  }
+  .controls button {
+    flex: 1 1 0; padding: 8px 10px; border: 1px solid #2b3a4d; border-radius: 6px;
+    background: #151d28; color: #dbe4ee; font: 600 12px Consolas, monospace;
+    cursor: pointer;
+  }
+  .controls button:hover { background: #1b2531; }
+  #go { border-color: #2f6b3d; color: #56d364; }
+  #hold { border-color: #2b4f7a; color: #6ea8fe; }
+  #stop { border-color: #7a2b2b; color: #ff7b72; }
+  #targetInfo { flex: 1 1 100%; color: #ff8a8a; font-size: 11px; word-break: break-all; }
+  .controls .hint { flex: 1 1 100%; font-size: 10px; }
+  #status { color: #9fb0c4; font-size: 11px; margin-top: 4px; }
+  .banner {
+    position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+    z-index: 6; background: #5a1d1d; color: #ffd7d5;
+    border: 1px solid #a33; border-radius: 6px; padding: 8px 12px;
+    font: 12px Consolas, monospace; display: none;
+  }
+  #camBox {
+    position: absolute; left: 12px; top: 150px; z-index: 5;
+    width: 320px; min-height: 240px; background: #000;
+    border: 1px solid #263140; border-radius: 8px; overflow: hidden;
+    box-shadow: 0 4px 18px rgba(0,0,0,.55);
+  }
+  #camBox canvas { display: block; width: 100%; min-height: 240px; height: auto; }
+  #camBox .camLabel {
+    position: absolute; top: 6px; left: 8px; z-index: 2;
+    color: #56d364; background: rgba(0,0,0,.55);
+    padding: 2px 5px; border-radius: 3px;
+    font: 600 10px Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <b>JAM-ME · GOOGLE MAPS</b><br>
+  <span class="muted">Görsel fix:</span> <span id="fix">—</span><br>
+  <span class="muted">Mod:</span> <span id="mode">—</span>
+  &nbsp; <span class="muted">Mesafe:</span> <span id="dist">—</span><br>
+  <span class="muted">Konum:</span> <span id="pos">—</span><br>
+  <span id="status">köprüye bağlanıyor…</span>
+</div>
+<div class="controls">
+  <button id="go">GO (hedefe)</button>
+  <button id="hold">HOLD</button>
+  <button id="stop">STOP</button>
+  <div id="targetInfo">Hedef: —</div>
+  <div class="hint muted">tık = hedef · çift tık = GO</div>
+</div>
+<div class="banner" id="banner"></div>
+<div id="camBox">
+  <span class="camLabel">LIVE · DOWNWARD</span>
+  <canvas id="camCanvas" width="640" height="480"></canvas>
+</div>
+
+<script>
+  const CENTER = { lat: __CENTER_LAT__, lng: __CENTER_LON__ };
+  const ZOOM = __ZOOM__;
+  const KEY_PRESENT = __KEY_PRESENT__;
+  let map, droneMarker, headingLine, targetMarker, missionLine, areaRect;
+  let target = null;
+  let missionKey = "";
+
+  function banner(text) {
+    const el = document.getElementById("banner");
+    el.textContent = text;
+    el.style.display = "block";
+  }
+  window.gm_authFailure = function () {
+    banner("Google Maps kimlik doğrulama hatası — API anahtarı/kısıtlarını kontrol edin.");
+  };
+
+  function indexOfBytes(hay, needle, from) {
+    outer: for (let i = from || 0; i <= hay.length - needle.length; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (hay[i + j] !== needle[j]) continue outer;
+      }
+      return i;
+    }
+    return -1;
+  }
+
+  async function startCamera() {
+    const canvas = document.getElementById("camCanvas");
+    const ctx = canvas.getContext("2d");
+    try {
+      const resp = await fetch("/stream.mjpg", { cache: "no-store" });
+      if (!resp.body) throw new Error("no stream body");
+      const reader = resp.body.getReader();
+      let buf = new Uint8Array(0);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const merged = new Uint8Array(buf.length + value.length);
+        merged.set(buf, 0);
+        merged.set(value, buf.length);
+        buf = merged;
+        let start = indexOfBytes(buf, [0xFF, 0xD8], 0);
+        let end = start >= 0 ? indexOfBytes(buf, [0xFF, 0xD9], start + 2) : -1;
+        while (start >= 0 && end >= 0) {
+          const jpg = buf.slice(start, end + 2);
+          buf = buf.slice(end + 2);
+          try {
+            const bmp = await createImageBitmap(new Blob([jpg], { type: "image/jpeg" }));
+            ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+          } catch (e) { /* skip a corrupt frame */ }
+          start = indexOfBytes(buf, [0xFF, 0xD8], 0);
+          end = start >= 0 ? indexOfBytes(buf, [0xFF, 0xD9], start + 2) : -1;
+        }
+        if (buf.length > 4000000) buf = new Uint8Array(0);
+      }
+      setTimeout(startCamera, 1200);
+    } catch (e) {
+      setTimeout(startCamera, 1500);
+    }
+  }
+
+  async function jget(path) {
+    const r = await fetch(path, { cache: "no-store" });
+    if (!r.ok) throw new Error(path + " " + r.status);
+    return await r.json();
+  }
+  async function jpost(path, body) {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    return await r.json();
+  }
+
+  function setTarget(lat, lng) {
+    target = { lat: lat, lng: lng };
+    targetMarker.setPosition(target);
+    targetMarker.setVisible(true);
+    document.getElementById("targetInfo").textContent =
+      "Hedef: " + lat.toFixed(7) + ", " + lng.toFixed(7);
+  }
+
+  async function go() {
+    if (!target) { banner("Önce haritada hedef seç."); return; }
+    const r = await jpost("/command", {
+      action: "go", lat: target.lat, lon: target.lng
+    });
+    if (!r.ok) banner("GO reddedildi: " + (r.error || "?"));
+  }
+  async function hold() { await jpost("/command", { action: "hold" }); }
+  async function stop() { await jpost("/command", { action: "stop" }); }
+
+  function init() {
+    if (!KEY_PRESENT) {
+      banner("GOOGLE_MAPS_API_KEY tanımlı değil — köprüyü anahtarla başlatın.");
+    }
+    map = new google.maps.Map(document.getElementById("map"), {
+      center: CENTER, zoom: ZOOM, mapTypeId: "satellite",
+      tilt: 0, streetViewControl: false, fullscreenControl: true,
+      mapTypeControl: true
+    });
+
+    droneMarker = new google.maps.Marker({
+      map: map, visible: false, title: "GÖRSEL FIX",
+      icon: {
+        path: google.maps.SymbolPath.CIRCLE, scale: 9,
+        fillColor: "#3fb950", fillOpacity: 1,
+        strokeColor: "#ffffff", strokeWeight: 2
+      }
+    });
+    headingLine = new google.maps.Polyline({
+      map: map, visible: false, strokeColor: "#3fb950", strokeWeight: 3
+    });
+    targetMarker = new google.maps.Marker({
+      map: map, visible: false, title: "HEDEF",
+      icon: {
+        path: google.maps.SymbolPath.CROSSHAIR, scale: 14,
+        strokeColor: "#ff5c5c", strokeWeight: 2
+      }
+    });
+    missionLine = new google.maps.Polyline({
+      map: map, strokeColor: "#4c8dff", strokeWeight: 2,
+      strokeOpacity: 0.85
+    });
+
+    map.addListener("click", (e) => setTarget(e.latLng.lat(), e.latLng.lng()));
+    map.addListener("dblclick", (e) => {
+      setTarget(e.latLng.lat(), e.latLng.lng());
+      go();
+    });
+    document.getElementById("go").addEventListener("click", go);
+    document.getElementById("hold").addEventListener("click", hold);
+    document.getElementById("stop").addEventListener("click", stop);
+
+    startCamera();
+    poll();
+    setInterval(poll, 500);
+  }
+
+  async function poll() {
+    try {
+      const st = await jget("/status");
+      const dr = await jget("/drive");
+      const est = st.estimated || null;
+
+      const fixEl = document.getElementById("fix");
+      if (est && st.fix_valid) {
+        fixEl.textContent = "VALID · " + (est.conf ? Math.round(est.conf * 100) : "?") + "%";
+        fixEl.className = "ok";
+      } else if (est) {
+        fixEl.textContent = "STALE";
+        fixEl.className = "warn";
+      } else {
+        fixEl.textContent = "NO FIX";
+        fixEl.className = "bad";
+      }
+
+      document.getElementById("mode").textContent = (dr.mode || "idle").toUpperCase();
+      document.getElementById("dist").textContent =
+        (dr.dist_m === null || dr.dist_m === undefined) ? "—" : Number(dr.dist_m).toFixed(1) + " m";
+
+      if (est) {
+        const p = { lat: est.lat, lng: est.lon };
+        droneMarker.setPosition(p);
+        droneMarker.setVisible(true);
+        const h = (Number(est.heading) || 0) * Math.PI / 180;
+        const dLat = Math.cos(h) * 0.00022;
+        const dLng = Math.sin(h) * 0.00022 /
+          Math.max(0.2, Math.cos(est.lat * Math.PI / 180));
+        headingLine.setPath([p, { lat: est.lat + dLat, lng: est.lon + dLng }]);
+        headingLine.setVisible(true);
+        document.getElementById("pos").textContent =
+          est.lat.toFixed(7) + ", " + est.lon.toFixed(7);
+      } else {
+        droneMarker.setVisible(false);
+        headingLine.setVisible(false);
+        document.getElementById("pos").textContent = "—";
+      }
+
+      if (dr.target && dr.target.length === 2) {
+        target = { lat: dr.target[0], lng: dr.target[1] };
+        targetMarker.setPosition(target);
+        targetMarker.setVisible(true);
+        document.getElementById("targetInfo").textContent =
+          "Hedef: " + target.lat.toFixed(7) + ", " + target.lng.toFixed(7);
+      }
+
+      const m = st.mission || {};
+      const pts = m.points || [];
+      const key = JSON.stringify(pts) + "|" + (m.active ? 1 : 0) + "|" + m.idx;
+      if (key !== missionKey) {
+        missionKey = key;
+        missionLine.setPath(pts.map(p => ({ lat: p[0], lng: p[1] })));
+      }
+
+      if (st.area && !areaRect) {
+        const a = st.area;
+        areaRect = new google.maps.Rectangle({
+          map: map,
+          bounds: {
+            north: a.lat[1], south: a.lat[0],
+            west: a.lon[0], east: a.lon[1]
+          },
+          strokeColor: "#8fa3b8", strokeOpacity: 0.8, strokeWeight: 1,
+          fillOpacity: 0.0, clickable: false
+        });
+        map.fitBounds(new google.maps.LatLngBounds(
+          { lat: a.lat[0], lng: a.lon[0] },
+          { lat: a.lat[1], lng: a.lon[1] }
+        ), 30);
+      }
+
+      const ageText = (st.fix_valid &&
+        st.fix_age_s !== null && st.fix_age_s !== undefined &&
+        st.fix_age_s < 60)
+        ? " · fix yaşı " + st.fix_age_s + " s" : "";
+      document.getElementById("status").textContent =
+        "köprü OK · karo " + (st.tiles_loaded || "?") + ageText;
+    } catch (e) {
+      document.getElementById("status").textContent = "köprü yok: " + e.message;
+    }
+  }
+</script>
+<script async defer
+  src="https://maps.googleapis.com/maps/api/js?key=__GOOGLE_MAPS_API_KEY__&callback=init&v=weekly"></script>
+</body>
+</html>

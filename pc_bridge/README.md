@@ -14,6 +14,34 @@ stream, localizes against satellite tiles, closes a GPS-free velocity
 loop, and publishes body-frame velocities for the phone. It also hosts
 the operator console (map, camera, calibration, missions).
 
+## Current real-aircraft path (Nov 2026)
+
+The field-proven path uses **RTSP from the phone**, a local **MJPEG** feed
+for the console, and a **Google Maps JavaScript** window (WebView2). RTMP
++ mediamtx remains a fallback only.
+
+```powershell
+$env:GOOGLE_MAPS_API_KEY="<key>"     # Maps JavaScript API; never commit it
+.\run_real.ps1 `
+  -TilesDir C:\...\sim_tiles_diyarbakir `
+  -Source "rtsp://jamme:jamme@<phone-ip>:8554/streaming/live/1" `
+  -MapProvider google
+```
+
+- The phone shows the real URL in its log: `Live555 gen url: ...`
+- The bridge reads RTSP directly; `mediamtx` is not needed.
+- The console camera uses `--rtsp-url http://127.0.0.1:8080/stream.mjpg`.
+- `google_map.py` opens the Google Maps window; it loads `/map` from the
+  bridge, which injects the API key server-side.
+- The Google window has a camera PiP; the Tkinter console still has the
+  LIVE DOWNLINK and all mission/speed controls.
+- Google **Map Tiles API is not required** for this window; the existing
+  Maps JavaScript API key works. Server-side dynamic tiles via
+  `--map-provider google` would require Map Tiles API.
+- RTMP fallback: use **mediamtx v1.9.3**. v1.21 fails DJI librtmp with
+  `HandShake: client signature does not match`.
+
+
 ```
 RTMP / file / sim ──► TileLocalizer ──► Kalman ──► calibrated fix
                                                         │
