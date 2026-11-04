@@ -510,6 +510,48 @@ class MapCanvas(tk.Canvas):
 # =============================================================
 # SMALL UI HELPERS
 # =============================================================
+class ScrollPanel(tk.Frame):
+    """Vertical scroll container — the control column fits any screen."""
+
+    def __init__(self, master, width):
+        super().__init__(master, bg=BG, width=width)
+        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, bd=0,
+                                width=max(100, width - 14))
+        self.bar = tk.Scrollbar(self, orient="vertical",
+                                command=self.canvas.yview,
+                                bg=CARD, troughcolor=BG, bd=0,
+                                highlightthickness=0, width=12)
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.bar.pack(side="right", fill="y")
+
+        self.inner = tk.Frame(self.canvas, bg=BG)
+        self._win = self.canvas.create_window((0, 0), window=self.inner,
+                                              anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
+        self.canvas.bind_all("<MouseWheel>", self._wheel)
+
+    def _on_inner(self, _event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas(self, event):
+        self.canvas.itemconfigure(self._win, width=event.width)
+
+    def _wheel(self, event):
+        # Global binding: only scroll when the pointer is over this panel,
+        # so the map's own wheel-zoom keeps working everywhere else.
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except tk.TclError:
+            return
+        while widget is not None and widget is not self:
+            widget = getattr(widget, "master", None)
+        if widget is not self:
+            return
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+
 def mk_card(parent, title, pady=(0, 6)):
     outer = tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
                      highlightthickness=1)
@@ -742,9 +784,12 @@ class TacticalApp:
         right = tk.Frame(body, bg=BG, width=378)
         right.pack(side="right", fill="both")
         right.pack_propagate(False)
+        panel = ScrollPanel(right, 378)
+        panel.pack(fill="both", expand=True)
+        inner = panel.inner
 
         # current position / calibration
-        _, body1, _ = mk_card(right, "CURRENT POSITION  ·  CALIBRATION")
+        _, body1, _ = mk_card(inner, "CURRENT POSITION  ·  CALIBRATION")
         row = tk.Frame(body1, bg=CARD)
         row.pack(fill="x")
         tk.Label(row, text="LAT", bg=CARD, fg=MUTED, font=UI_S,
@@ -767,7 +812,7 @@ class TacticalApp:
         self.cal_label.pack(fill="x", pady=(4, 0))
 
         # target / flight control
-        _, body2, _ = mk_card(right, "TARGET")
+        _, body2, _ = mk_card(inner, "TARGET")
         row = tk.Frame(body2, bg=CARD)
         row.pack(fill="x")
         tk.Label(row, text="LAT", bg=CARD, fg=MUTED, font=UI_S,
@@ -798,8 +843,8 @@ class TacticalApp:
         self.btn_stop.pack(side="left", fill="x", expand=True, padx=(3, 0))
 
         # mission
-        _, body3, _ = mk_card(right, "MISSION QUEUE")
-        self.mission_list = tk.Listbox(body3, height=4, bg="#0c131b",
+        _, body3, _ = mk_card(inner, "MISSION QUEUE")
+        self.mission_list = tk.Listbox(body3, height=3, bg="#0c131b",
                                        fg=TEXT, selectbackground="#25405e",
                                        selectforeground="white", font=MONO_S,
                                        relief="flat", highlightthickness=1,
@@ -826,7 +871,7 @@ class TacticalApp:
                   font=UI_S).pack(side="left")
 
         # speed
-        _, body4, _ = mk_card(right, "SPEED LIMIT")
+        _, body4, _ = mk_card(inner, "SPEED LIMIT")
         srow = tk.Frame(body4, bg=CARD)
         srow.pack(fill="x")
         self.speed_label = tk.Label(srow, text="2.5 m/s", bg=CARD, fg=TEXT,
@@ -843,16 +888,16 @@ class TacticalApp:
         self.speed_scale.bind("<ButtonRelease-1>", self.on_speed_release)
 
         # log
-        logcard = tk.Frame(right, bg=CARD, highlightbackground=BORDER,
+        logcard = tk.Frame(inner, bg=CARD, highlightbackground=BORDER,
                            highlightthickness=1)
-        logcard.pack(fill="both", expand=True, pady=(0, 0))
+        logcard.pack(fill="x", pady=(0, 4))
         tk.Label(logcard, text="EVENT LOG", bg=CARD, fg=MUTED, font=UI_S,
                  anchor="w").pack(fill="x", padx=10, pady=(6, 2))
-        self.log_text = tk.Text(logcard, height=4, bg="#0b1118", fg="#9fb0c4",
+        self.log_text = tk.Text(logcard, height=5, bg="#0b1118", fg="#9fb0c4",
                                 insertbackground=TEXT, font=MONO_S,
                                 relief="flat", highlightthickness=0,
                                 state="disabled", wrap="word")
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self.log_text.pack(fill="x", padx=10, pady=(0, 8))
 
     def _build_statusbar(self):
         bar = tk.Frame(self.root, bg=PANEL, height=24)
