@@ -63,7 +63,7 @@ Start-Console "JAM-Me Bridge" $bridgeCmd
 
 Start-Sleep -Seconds 2
 $guiMapProvider = $MapProvider
-if ($MapProvider -eq "google") { $guiMapProvider = "esri" }
+if ($MapProvider -eq "google") { $guiMapProvider = "local" }
 $guiExtra = ""
 if ($isRtsp) { $guiExtra += " --rtsp-url 'http://127.0.0.1:$Port/stream.mjpg'" }
 if ($guiMapProvider -ne "local") { $guiExtra += " --map-provider $guiMapProvider" }

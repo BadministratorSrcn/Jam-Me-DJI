@@ -40,6 +40,18 @@ $env:GOOGLE_MAPS_API_KEY="<key>"     # Maps JavaScript API; never commit it
   `--map-provider google` would require Map Tiles API.
 - RTMP fallback: use **mediamtx v1.9.3**. v1.21 fails DJI librtmp with
   `HandShake: client signature does not match`.
+- If ESRI imagery is stale, build a Google control tile set for the same
+  grid (unofficial VT endpoint; ToS risk) and use it for **both** bridge
+  and GUI:
+  ```powershell
+  cd C:\...\JAMME
+  python download_google_vt.py --tile-dir sim_tiles_diyarbakir `
+    --output sim_tiles_diyarbakir_google --zoom 19
+  ```
+  Then pass `--tiles-dir ...\sim_tiles_diyarbakir_google` to the bridge
+  and `control_gui.py` (and `--map-provider local` so the Tkinter mosaic
+  is Google too). The licensed alternative is Map Tiles API +
+  `download_google_tiles.py`.
 
 
 ```

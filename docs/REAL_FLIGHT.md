@@ -75,6 +75,37 @@ DJI kamera → telefon RTSP (31 fps, 720p) → bridge ffmpeg
 - İlk uçuş: 50–100 m, kamera -90°, ışık ve dokulu zemin.
 - Fix yoksa/gecikirse bridge hızları sıfırlar; kör uçuş yok.
 
+### Google kontrol karoları
+
+ESRI görüntüsü eskiyse, **görsel fix'in kullandığı** karoları Google'dan
+aynı grid/georeferansla yeniden üret:
+
+```powershell
+cd C:\Users\LNx\Desktop\Opencode\JAMME
+python download_google_vt.py `
+  --tile-dir sim_tiles_diyarbakir `
+  --output sim_tiles_diyarbakir_google `
+  --zoom 19
+```
+
+Sonra bridge ve GUI'yi **aynı Google karo diziniyle** başlat:
+
+```powershell
+python pc_bridge\bridge_server.py --source "rtsp://..." `
+  --tiles-dir C:\Users\LNx\Desktop\Opencode\JAMME\sim_tiles_diyarbakir_google
+python pc_bridge\control_gui.py `
+  --tiles-dir C:\Users\LNx\Desktop\Opencode\JAMME\sim_tiles_diyarbakir_google `
+  --port 8080 --rtsp-url http://127.0.0.1:8080/stream.mjpg --map-provider local
+```
+
+`--map-provider local` Tkinter haritasını da yerel Google mozaiğinden çizer;
+Google Maps penceresi ayrıca canlı Google uydu haritasını gösterir.
+
+> **Uyarı:** `download_google_vt.py`, Google'ın genel `mt*.google.com/vt`
+> karo uç noktasını kullanır; resmî **Map Tiles API** değildir. Google
+> şartları açısından önbellekleme riski vardır. Lisanslı kullanım için
+> Map Tiles API'yi açıp `download_google_tiles.py` kullanın.
+
 ### Drone kapalıyken
 
 Video, `/snapshot` ve `/stream.mjpg` boş kalır; bu normaldir. Drone açılıp
